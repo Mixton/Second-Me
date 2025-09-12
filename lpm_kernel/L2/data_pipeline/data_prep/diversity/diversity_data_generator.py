@@ -13,7 +13,7 @@ from enum import Enum
 import tiktoken
 from lpm_kernel.api.services.user_llm_config_service import UserLLMConfigService
 from lpm_kernel.configs.config import Config
-from lpm_kernel.L2.data_pipeline.data_prep.diversity.utils import remove_similar_dicts
+from lpm_kernel.L2.data_pipeline.data_prep.diversity.utils import dedup_by_similarity
 import lpm_kernel.L2.data_pipeline.data_prep.diversity.template_diversity as template_diversity
 
 from lpm_kernel.configs.logging import get_train_process_logger
@@ -291,7 +291,7 @@ class DiversityDataGenerator:
         # clean note level data
         for entity, entity_info in entity2desc.copy().items():
             clusters = entity_info["note"]
-            unique_dicts, cnt = remove_similar_dicts(clusters, similarity_threshold=0.9)
+            unique_dicts, cnt = dedup_by_similarity(clusters, similarity_threshold=0.9) # need to adjust min_trigram_jaccard threshold based on data length
             entity2desc[entity]["note"] = unique_dicts
 
         # read config file
