@@ -59,7 +59,6 @@ class LocalLLMService:
 
             # Check for CUDA availability if GPU was requested
             cuda_available = torch.cuda.is_available() if use_gpu else False
-            cuda_available = False
             gpu_info = ""
             
             if use_gpu and cuda_available:

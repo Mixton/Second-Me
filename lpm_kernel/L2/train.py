@@ -4,6 +4,7 @@ import logging
 from tqdm import tqdm
 import functools
 # Standard library imports
+import gc
 import os
 import sys
 import time
@@ -202,6 +203,29 @@ def main(model_args, data_args, training_args):
     # Apply PyTorch memory optimizations to training arguments
     logger.info("Applying memory optimizations to training configuration")
     training_args = memory_manager.optimize_training_args(training_args)
+    
+    # Additional memory-conservative training configurations
+    if torch.cuda.is_available() and memory_manager.get_memory_info().get("vram_total_gb", 0) < 16:
+        logger.info("Applying additional memory optimizations for limited VRAM")
+        
+        # Reduce batch size if it's too high for available memory
+        if hasattr(training_args, 'per_device_train_batch_size') and training_args.per_device_train_batch_size > 2:
+            original_batch = training_args.per_device_train_batch_size
+            training_args.per_device_train_batch_size = 1
+            training_args.gradient_accumulation_steps = max(training_args.gradient_accumulation_steps, original_batch)
+            logger.info(f"Reduced batch size from {original_batch} to 1, increased gradient accumulation to {training_args.gradient_accumulation_steps}")
+        
+        # Enable memory-efficient options
+        training_args.dataloader_pin_memory = False  # Disable pin memory to save RAM
+        training_args.gradient_checkpointing = True  # Enable gradient checkpointing
+        if hasattr(training_args, 'fp16') and not training_args.fp16 and not hasattr(training_args, 'bf16'):
+            training_args.fp16 = True  # Enable FP16 if not already set
+            logger.info("Enabled FP16 for memory efficiency")
+        
+        # Set conservative evaluation strategy to save memory
+        if hasattr(training_args, 'evaluation_strategy'):
+            training_args.evaluation_strategy = "no"  # Disable evaluation during training to save memory
+            logger.info("Disabled evaluation during training to save memory")
 
     # --- Accelerate optimizer state offloading logic ---
     # Enable optimizer state offload to CPU if VRAM is low and not using DeepSpeed
@@ -236,7 +260,9 @@ def main(model_args, data_args, training_args):
     model_kwargs = {
         # Don't use "auto" device_map initially to avoid meta tensor issues
         "device_map": None,
-        "trust_remote_code": True
+        "trust_remote_code": True,
+        "torch_dtype": torch.float16 if torch.cuda.is_available() else torch.float32,  # Use FP16 for memory efficiency
+        "low_cpu_mem_usage": True,  # Reduce CPU memory usage during loading
     }
     
     # Configure quantization if requested
@@ -275,10 +301,29 @@ def main(model_args, data_args, training_args):
     )
     
     # If model has meta tensors, handle them properly
-    if hasattr(model, "is_meta") and model.is_meta:
+    def has_meta_tensors(module):
+        """Check if module or any of its parameters are on meta device"""
+        for param in module.parameters():
+            if param.device.type == 'meta':
+                return True
+        return False
+    
+    if has_meta_tensors(model):
         logger.info("Model has meta tensors, using to_empty() to properly initialize")
         device = "cuda" if torch.cuda.is_available() and model_args.use_cuda else "cpu"
-        model = model.to_empty(device=device)
+        
+        # Use to_empty to move from meta device
+        try:
+            model = model.to_empty(device=device)
+            logger.info(f"Successfully moved model from meta device to {device}")
+        except Exception as e:
+            logger.warning(f"Failed to use to_empty(), trying alternative approach: {e}")
+            # Alternative approach: iterate through parameters
+            for name, param in model.named_parameters():
+                if param.device.type == 'meta':
+                    # Replace meta tensor with empty tensor on target device
+                    param.data = torch.empty_like(param, device=device)
+            logger.info(f"Alternative meta tensor handling completed for device {device}")
     
     # Apply gradient checkpointing for memory efficiency
     if training_args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
@@ -287,9 +332,16 @@ def main(model_args, data_args, training_args):
         model.config.use_cache = False
     
     # Allow only one full forward/backward pass at a time (if needed for memory)
-    if torch.cuda.is_available() and memory_manager.get_memory_info().get("vram_total_gb", 0) < 8:
-        torch.cuda.set_per_process_memory_fraction(0.9)
-        logger.info("Setting memory fraction limit to avoid OOM errors")
+    if torch.cuda.is_available() and memory_manager.get_memory_info().get("vram_total_gb", 0) < 16:
+        # Set more conservative memory fraction for GPUs with limited VRAM
+        memory_fraction = 0.85 if memory_manager.get_memory_info().get("vram_total_gb", 0) < 8 else 0.90
+        torch.cuda.set_per_process_memory_fraction(memory_fraction)
+        logger.info(f"Setting memory fraction limit to {memory_fraction} to avoid OOM errors")
+        
+        # Enable memory efficient attention and other optimizations
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        logger.info("Enabled TF32 for better memory efficiency")
 
     # datasets
     train_dataset = create_chat_data(
@@ -305,12 +357,19 @@ def main(model_args, data_args, training_args):
         "append_concat_token": data_args.append_concat_token,
         "add_special_tokens": data_args.add_special_tokens,
     }
+    
+    # Final check: ensure model is not on meta device before creating trainer
+    if has_meta_tensors(model):
+        logger.error("Model still has meta tensors after initialization attempts!")
+        raise RuntimeError("Model contains meta tensors that were not properly initialized. Cannot proceed with training.")
+    else:
+        logger.info("Model successfully initialized without meta tensors")
 
-    # Use DeepSpeed to handle meta tensors if available
+    # Additional meta tensor handling for DeepSpeed compatibility
     try:
-        # Only configure DeepSpeed if meta tensors are present and DeepSpeed is available
-        if hasattr(model, "is_meta") and model.is_meta:
-            logger.info("Model has meta tensors, checking DeepSpeed availability")
+        # Only configure DeepSpeed if there were meta tensors and they need special handling
+        if has_meta_tensors(model):
+            logger.info("Checking for additional meta tensor handling requirements")
             # First verify DeepSpeed is properly installed and importable
             try:
                 import deepspeed
@@ -330,24 +389,14 @@ def main(model_args, data_args, training_args):
                 }
                 logger.info("DeepSpeed configured for meta tensor handling")
             except ImportError:
-                logger.warning("DeepSpeed is not available, meta tensors will be handled differently")
-                # If DeepSpeed isn't available, use alternative approach to handle meta tensors
-                if torch.cuda.is_available() and model_args.use_cuda:
-                    logger.info("Initializing meta tensors on GPU")
-                    # Use device_map instead of DeepSpeed for meta tensor initialization
-                    from accelerate import init_empty_weights
-                    with init_empty_weights():
-                        model.to_empty(device="cuda")
-                else:
-                    logger.info("Initializing meta tensors on CPU")
-                    model.to_empty(device="cpu")
+                logger.warning("DeepSpeed is not available, meta tensors already handled above")
     except Exception as e:
-        logger.warning(f"Could not configure meta tensor handling: {e}")
+        logger.warning(f"Could not configure additional meta tensor handling: {e}")
         logger.warning(traceback.format_exc())
 
     trainer = SFTTrainer(
         model=model,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         args=training_args,
         train_dataset=train_dataset,
         peft_config=peft_config,
@@ -361,24 +410,51 @@ def main(model_args, data_args, training_args):
     if hasattr(trainer.model, "print_trainable_parameters"):
         trainer.model.print_trainable_parameters()
     
-    # Memory usage tracking callback
+    # Memory usage tracking callback with aggressive memory management
     class MemoryMonitorCallback(transformers.TrainerCallback):
         def __init__(self):
             self.memory_manager = get_memory_manager()
+            self.last_memory_cleanup = 0
         
-        def on_step_end(self, args, state, control, **kwargs):
-            # Check memory every 5 steps
-            if state.global_step % 5 == 0 and torch.cuda.is_available():
+        def on_step_begin(self, args, state, control, **kwargs):
+            # Aggressive memory cleanup before each step if memory is critical
+            if torch.cuda.is_available():
                 info = self.memory_manager.get_memory_info()
                 vram_usage_pct = info.get("vram_used_gb", 0) / info.get("vram_total_gb", 1) * 100
                 
-                if vram_usage_pct > 90:
-                    logger.info(f"VRAM usage high ({vram_usage_pct:.1f}%), cleaning cache")
+                if vram_usage_pct > 85:  # Lowered threshold for earlier intervention
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+        
+        def on_step_end(self, args, state, control, **kwargs):
+            # Check memory every 3 steps (more frequent)
+            if state.global_step % 3 == 0 and torch.cuda.is_available():
+                info = self.memory_manager.get_memory_info()
+                vram_usage_pct = info.get("vram_used_gb", 0) / info.get("vram_total_gb", 1) * 100
+                
+                if vram_usage_pct > 80:  # Earlier intervention
+                    logger.info(f"VRAM usage at {vram_usage_pct:.1f}%, performing memory cleanup")
                     self.memory_manager.cleanup_memory()
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    self.last_memory_cleanup = state.global_step
+                    
+                    # Log memory after cleanup
+                    info_after = self.memory_manager.get_memory_info()
+                    vram_after_pct = info_after.get("vram_used_gb", 0) / info_after.get("vram_total_gb", 1) * 100
+                    logger.info(f"VRAM usage after cleanup: {vram_after_pct:.1f}%")
         
         def on_save(self, args, state, control, **kwargs):
             # Free up memory before saving
+            logger.info("Cleaning memory before model save")
             self.memory_manager.cleanup_memory(force=True)
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            
+        def on_log(self, args, state, control, **kwargs):
+            # Clean memory on log events to prevent accumulation
+            if torch.cuda.is_available() and state.global_step - self.last_memory_cleanup > 10:
+                torch.cuda.empty_cache()
 
     # Add memory monitoring
     trainer.add_callback(MemoryMonitorCallback())
@@ -391,10 +467,66 @@ def main(model_args, data_args, training_args):
     if training_args.resume_from_checkpoint is not None:
         checkpoint = training_args.resume_from_checkpoint
 
-    # Training with automatic memory management
+    # Set PyTorch CUDA memory configuration for better memory management
+    if torch.cuda.is_available():
+        # Enable memory pool for better fragmentation handling
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
+        logger.info("Set PyTorch CUDA memory configuration for better fragmentation handling")
+        
+        # Force garbage collection and empty cache before training
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        
+        # Log initial memory state
+        info = memory_manager.get_memory_info()
+        logger.info(f"Pre-training memory: VRAM: {info.get('vram_used_gb', 0):.2f}GB / {info.get('vram_total_gb', 0):.2f}GB")
+
+    # Training with automatic memory management and OOM recovery
     try:
         logger.info("Starting training with memory-optimized configuration")
         trainer.train(resume_from_checkpoint=checkpoint)
+    except torch.OutOfMemoryError as oom_e:
+        logger.error(f"CUDA Out of Memory Error: {str(oom_e)}")
+        logger.info("Attempting memory cleanup and recovery...")
+        
+        # Aggressive cleanup
+        memory_manager.cleanup_memory(force=True)
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        
+        # Try reducing batch size if possible
+        if hasattr(training_args, 'per_device_train_batch_size') and training_args.per_device_train_batch_size > 1:
+            original_batch_size = training_args.per_device_train_batch_size
+            training_args.per_device_train_batch_size = max(1, original_batch_size // 2)
+            training_args.gradient_accumulation_steps = training_args.gradient_accumulation_steps * 2
+            logger.info(f"Reduced batch size from {original_batch_size} to {training_args.per_device_train_batch_size}")
+            logger.info(f"Increased gradient accumulation steps to {training_args.gradient_accumulation_steps}")
+            
+            # Recreate trainer with new batch size
+            trainer = SFTTrainer(
+                model=model,
+                processing_class=tokenizer,
+                args=training_args,
+                train_dataset=train_dataset,
+                peft_config=peft_config,
+                formatting_func=formatting_prompts_func,
+                data_collator=collator,
+            )
+            
+            # Re-add callbacks
+            trainer.add_callback(MemoryMonitorCallback())
+            trainer.add_callback(DebugCallback())
+            
+            logger.info("Retrying training with reduced batch size...")
+            try:
+                trainer.train(resume_from_checkpoint=checkpoint)
+            except Exception as retry_e:
+                logger.error(f"Training failed even with reduced batch size: {str(retry_e)}")
+                raise
+        else:
+            logger.error("Cannot reduce batch size further, training failed")
+            raise
     except Exception as e:
         logger.error(f"Error during training: {str(e)}")
         logger.error(f"Error type: {type(e)}")
