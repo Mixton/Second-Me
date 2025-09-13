@@ -5,6 +5,7 @@ import traceback
 
 from openai import OpenAI
 import numpy as np
+import tiktoken
 
 from lpm_kernel.L1.bio import (
     Cluster,
@@ -42,6 +43,13 @@ class ShadeGenerator:
             "presence_penalty": 0,
             "timeout": 45,
         }
+        # Initialize tokenizer for token management
+        try:
+            self.tokenizer = tiktoken.get_encoding("cl100k_base")
+        except:
+            logger.warning("Could not initialize tiktoken, falling back to character counting")
+            self.tokenizer = None
+        
         self.user_llm_config_service = UserLLMConfigService()
         self.user_llm_config = self.user_llm_config_service.get_available_llm()
         if self.user_llm_config is None:
@@ -54,6 +62,164 @@ class ShadeGenerator:
             )
             self.model_name = self.user_llm_config.chat_model_name
         self._top_p_adjusted = False  # Flag to track if top_p has been adjusted
+
+    def _count_tokens(self, text: str) -> int:
+        """Count tokens in a text string."""
+        if self.tokenizer:
+            return len(self.tokenizer.encode(text))
+        else:
+            # Fallback to character count estimation (roughly 4 chars per token)
+            return len(text) // 4
+
+    def _truncate_note_content(self, note: Note, max_tokens: int) -> str:
+        """Intelligently truncate a note's content to fit within token limits.
+        
+        Args:
+            note: The note to truncate
+            max_tokens: Maximum tokens allowed for this note
+            
+        Returns:
+            Truncated note content as string
+        """
+        full_content = note.to_str()
+        
+        if self._count_tokens(full_content) <= max_tokens:
+            return full_content
+            
+        # Try to preserve structure by keeping the beginning and trimming intelligently
+        lines = full_content.split('\n')
+        result_lines = []
+        current_tokens = 0
+        
+        # Always include the first few lines (metadata/title)
+        for i, line in enumerate(lines[:3]):  # Keep first 3 lines
+            line_tokens = self._count_tokens(line + '\n')
+            if current_tokens + line_tokens > max_tokens:
+                break
+            result_lines.append(line)
+            current_tokens += line_tokens
+        
+        # Add remaining lines until we hit the token limit
+        remaining_budget = max_tokens - current_tokens
+        if remaining_budget > 100:  # Only continue if we have reasonable space left
+            remaining_lines = lines[len(result_lines):]
+            
+            for line in remaining_lines:
+                line_tokens = self._count_tokens(line + '\n')
+                if current_tokens + line_tokens > max_tokens - 50:  # Leave buffer
+                    break
+                result_lines.append(line)
+                current_tokens += line_tokens
+                
+        # Add truncation indicator if we cut content
+        if len(result_lines) < len(lines):
+            result_lines.append(f"\n[CONTENT TRUNCATED - Original had {len(lines)} lines, showing {len(result_lines)}]")
+            
+        return '\n'.join(result_lines)
+
+    def _manage_memory_tokens(self, new_memory_list: List[Note], max_total_tokens: int = 100000) -> str:
+        """Manage token limits across multiple notes for prompt generation.
+        
+        Args:
+            new_memory_list: List of notes to process
+            max_total_tokens: Maximum total tokens for all notes combined
+            
+        Returns:
+            Combined prompt string with token management applied
+        """
+        if not new_memory_list:
+            return ""
+            
+        # Reserve space for system prompt and output (estimated)
+        available_tokens = max_total_tokens - 5000  # Conservative buffer
+        
+        # Calculate tokens per note (distributed evenly with minimum)
+        min_tokens_per_note = 500  # Minimum meaningful content per note
+        max_tokens_per_note = available_tokens // len(new_memory_list)
+        
+        # Ensure each note gets at least minimum tokens, but cap at reasonable max
+        tokens_per_note = max(min_tokens_per_note, min(max_tokens_per_note, 8000))
+        
+        logger.info(f"Managing {len(new_memory_list)} notes with {tokens_per_note} tokens each (max total: {max_total_tokens})")
+        
+        processed_notes = []
+        actual_total_tokens = 0
+        
+        for i, note in enumerate(new_memory_list):
+            truncated_content = self._truncate_note_content(note, tokens_per_note)
+            note_tokens = self._count_tokens(truncated_content)
+            actual_total_tokens += note_tokens
+            processed_notes.append(truncated_content)
+            
+            logger.debug(f"Note {i}: {note_tokens} tokens")
+            
+        combined_prompt = "\n\n".join(processed_notes)
+        logger.info(f"Final prompt: {actual_total_tokens} tokens ({len(combined_prompt)} characters)")
+        
+        return combined_prompt
+
+    def _manage_shade_merge_tokens(self, shade_info_list: List[ShadeInfo], max_total_tokens: int = 80000) -> str:
+        """Manage token limits when merging multiple shades.
+        
+        Args:
+            shade_info_list: List of shade information to merge
+            max_total_tokens: Maximum total tokens for all shades combined
+            
+        Returns:
+            Combined prompt string with token management applied
+        """
+        if not shade_info_list:
+            return ""
+            
+        # Reserve space for system prompt and output
+        available_tokens = max_total_tokens - 3000
+        
+        # Calculate tokens per shade
+        tokens_per_shade = available_tokens // len(shade_info_list)
+        tokens_per_shade = max(1000, min(tokens_per_shade, 10000))  # Min 1k, max 10k per shade
+        
+        logger.info(f"Managing {len(shade_info_list)} shades with {tokens_per_shade} tokens each")
+        
+        processed_shades = []
+        actual_total_tokens = 0
+        
+        for i, shade_info in enumerate(shade_info_list):
+            full_shade_text = f"User Interest Domain {i} Analysis:\n{shade_info.to_str()}"
+            
+            # Truncate if necessary
+            if self._count_tokens(full_shade_text) > tokens_per_shade:
+                # Keep the header and truncate the content
+                header = f"User Interest Domain {i} Analysis:\n"
+                available_for_content = tokens_per_shade - self._count_tokens(header)
+                
+                shade_content = shade_info.to_str()
+                content_lines = shade_content.split('\n')
+                
+                truncated_lines = []
+                current_tokens = 0
+                
+                for line in content_lines:
+                    line_tokens = self._count_tokens(line + '\n')
+                    if current_tokens + line_tokens > available_for_content - 100:  # Leave buffer
+                        truncated_lines.append("[CONTENT TRUNCATED]")
+                        break
+                    truncated_lines.append(line)
+                    current_tokens += line_tokens
+                
+                truncated_content = header + '\n'.join(truncated_lines)
+            else:
+                truncated_content = full_shade_text
+            
+            shade_tokens = self._count_tokens(truncated_content)
+            actual_total_tokens += shade_tokens
+            processed_shades.append(truncated_content)
+            
+            logger.debug(f"Shade {i}: {shade_tokens} tokens")
+        
+        combined_prompt = "\n\n".join(processed_shades)
+        logger.info(f"Final shade merge prompt: {actual_total_tokens} tokens ({len(combined_prompt)} characters)")
+        
+        return combined_prompt
 
     def _fix_top_p_param(self, error_message: str) -> bool:
         """Fixes the top_p parameter if an API error indicates it's invalid.
@@ -252,7 +418,12 @@ Domain Timelines:
         Returns:
             A new ShadeInfo object generated from the memories.
         """
-        user_prompt = "\n\n".join([memory.to_str() for memory in new_memory_list])
+        # Use token-managed prompt generation instead of simple concatenation
+        user_prompt = self._manage_memory_tokens(new_memory_list, max_total_tokens=100000)
+        
+        # Log token usage for monitoring
+        total_tokens = self._count_tokens(user_prompt)
+        logger.info(f"Generated prompt with {total_tokens} tokens for {len(new_memory_list)} notes")
 
         shade_generate_message = self._build_message(SHADE_INITIAL_PROMPT, user_prompt)
 
@@ -275,12 +446,12 @@ Domain Timelines:
         Returns:
             A new ShadeInfo object representing the merged shade.
         """
-        user_prompt = "\n\n".join(
-            [
-                f"User Interest Domain {i} Analysis:\n{old_shade_info.to_str()}"
-                for i, old_shade_info in enumerate(shade_info_list)
-            ]
-        )
+        # Use token-managed prompt generation for shade merging
+        user_prompt = self._manage_shade_merge_tokens(shade_info_list, max_total_tokens=80000)
+        
+        # Log token usage for monitoring
+        total_tokens = self._count_tokens(user_prompt)
+        logger.info(f"Generated shade merge prompt with {total_tokens} tokens for {len(shade_info_list)} shades")
 
         merge_shades_message = self._build_message(SHADE_MERGE_PROMPT, user_prompt)
         response = self._call_llm_with_retry(merge_shades_message)
