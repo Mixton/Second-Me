@@ -5,6 +5,7 @@ import logging
 import random
 import re
 import traceback
+from typing import List
 
 import openai
 import pandas as pd
@@ -178,8 +179,82 @@ class DiversityDataGenerator:
         
         return result_dict
 
-    def _manage_cluster_tokens(self, cluster: dict, max_total_tokens: int = 50000) -> dict:
+    def _create_cluster_chunks(self, cluster: dict, max_chunk_tokens: int = 15000, template_reserve: int = 8000) -> List[dict]:
+        """Split a large cluster into smaller chunks that fit within token limits.
+        
+        Args:
+            cluster: The cluster containing notes to process
+            max_chunk_tokens: Maximum tokens per chunk (including template overhead)
+            template_reserve: Tokens to reserve for system prompts and templates
+            
+        Returns:
+            List of cluster chunks, each within token limits
+        """
+        notes = cluster.get("note", [])
+        if not notes:
+            return [cluster]
+        
+        # Calculate available tokens for actual content
+        available_tokens_per_chunk = max_chunk_tokens - template_reserve
+        
+        chunks = []
+        current_chunk_notes = []
+        current_chunk_tokens = 0
+        
+        logger.info(f"Chunking cluster '{cluster.get('entity_name', 'unknown')}' with {len(notes)} notes")
+        
+        for note_dict in notes:
+            # Calculate tokens for this note
+            if "processed" in note_dict:
+                content = note_dict["processed"]
+            else:
+                content = f"Title: {note_dict.get('title', '')}\nContent: {note_dict.get('content', '')}\nAI Insight: {note_dict.get('insight', '')}"
+            
+            note_tokens = self._count_tokens(content)
+            
+            # If this single note exceeds chunk limits, truncate it
+            if note_tokens > available_tokens_per_chunk:
+                logger.warning(f"Note exceeds chunk limit ({note_tokens} > {available_tokens_per_chunk}), truncating")
+                truncated_note = self._truncate_note_content(note_dict, available_tokens_per_chunk)
+                note_dict = truncated_note
+                note_tokens = self._count_tokens(
+                    truncated_note.get("processed", 
+                    f"Title: {truncated_note.get('title', '')}\nContent: {truncated_note.get('content', '')}\nAI Insight: {truncated_note.get('insight', '')}")
+                )
+            
+            # Check if adding this note would exceed chunk limit
+            if current_chunk_notes and (current_chunk_tokens + note_tokens > available_tokens_per_chunk):
+                # Finalize current chunk
+                chunk = cluster.copy()
+                chunk["note"] = current_chunk_notes.copy()
+                chunk["chunk_info"] = f"chunk_{len(chunks)+1}_of_multiple"
+                chunks.append(chunk)
+                logger.info(f"Created chunk {len(chunks)} with {len(current_chunk_notes)} notes, {current_chunk_tokens} tokens")
+                
+                # Start new chunk
+                current_chunk_notes = []
+                current_chunk_tokens = 0
+            
+            # Add note to current chunk
+            current_chunk_notes.append(note_dict)
+            current_chunk_tokens += note_tokens
+        
+        # Add final chunk if it has notes
+        if current_chunk_notes:
+            chunk = cluster.copy()
+            chunk["note"] = current_chunk_notes.copy()
+            chunk["chunk_info"] = f"chunk_{len(chunks)+1}_of_multiple" if chunks else "single_chunk"
+            chunks.append(chunk)
+            logger.info(f"Created final chunk {len(chunks)} with {len(current_chunk_notes)} notes, {current_chunk_tokens} tokens")
+        
+        logger.info(f"Split cluster '{cluster.get('entity_name', 'unknown')}' into {len(chunks)} chunks")
+        return chunks
+
+    def _manage_cluster_tokens(self, cluster: dict, max_total_tokens: int = 20000) -> dict:
         """Manage token limits for a cluster of notes.
+        
+        This method now primarily serves as a fallback for small clusters
+        that don't need chunking.
         
         Args:
             cluster: The cluster containing notes to process
@@ -192,15 +267,14 @@ class DiversityDataGenerator:
         if not notes:
             return cluster
         
-        # Reserve more space for template text, entity info, system prompts and output
-        # Being very conservative due to large template prompts
-        available_tokens = max_total_tokens - 10000
+        # Reserve space for template text, entity info, system prompts and output
+        available_tokens = max_total_tokens - 5000
         
-        # Calculate tokens per note - be more aggressive with limits
+        # Calculate tokens per note - be more reasonable since we now have chunking
         max_tokens_per_note = available_tokens // len(notes)
-        max_tokens_per_note = max(300, min(max_tokens_per_note, 3000))  # Reduced: Min 300, max 3k per note
+        max_tokens_per_note = max(500, min(max_tokens_per_note, 2500))  # More generous: Min 500, max 2.5k per note
         
-        logger.debug(f"Managing cluster '{cluster.get('entity_name', 'unknown')}' with {len(notes)} notes, {max_tokens_per_note} tokens each")
+        logger.info(f"Managing cluster '{cluster.get('entity_name', 'unknown')}' with {len(notes)} notes, {max_tokens_per_note} tokens each (max_total: {max_total_tokens})")
         
         # Process each note
         managed_notes = []
@@ -222,7 +296,7 @@ class DiversityDataGenerator:
         managed_cluster = cluster.copy()
         managed_cluster["note"] = managed_notes
         
-        logger.debug(f"Cluster token usage: {total_tokens} tokens for {len(managed_notes)} notes")
+        logger.info(f"Cluster '{cluster.get('entity_name', 'unknown')}' final token usage: {total_tokens} tokens for {len(managed_notes)} notes")
         
         return managed_cluster
 
@@ -313,12 +387,20 @@ class DiversityDataGenerator:
         Returns:
             A string containing the formatted input for the answer generation model.
         """
-        # Apply token management to the cluster
-        managed_cluster = self._manage_cluster_tokens(cluster, max_total_tokens=50000)
+        # Use the cluster as-is if it's already been chunked, otherwise apply token management
+        if "chunk_info" in cluster:
+            managed_cluster = cluster
+            logger.info(f"Using pre-chunked cluster: {cluster['chunk_info']}")
+        else:
+            managed_cluster = self._manage_cluster_tokens(cluster, max_total_tokens=20000)
         
         entity = managed_cluster["entity_name"]
         entity_desc = managed_cluster["entity_description"]
         entity_desc = f"Entity'{entity}',Relevant Info：'{entity_desc}'"
+
+        # Add chunk information to entity description if available
+        if "chunk_info" in managed_cluster:
+            entity_desc += f" ({managed_cluster['chunk_info']})"
 
         tmpl = f"""I am {user_name}. Regarding {entity_desc}, here is some information I previously mentioned:\n\n"""
 
@@ -343,7 +425,7 @@ class DiversityDataGenerator:
         
         # Log final token usage for monitoring
         total_tokens = self._count_tokens(tmpl)
-        logger.debug(f"Generated A_input with {total_tokens} tokens for cluster '{entity}'")
+        logger.info(f"Generated A_input with {total_tokens} tokens for cluster '{entity}' ({managed_cluster.get('chunk_info', 'no chunk info')})")
 
         return tmpl
 
@@ -358,12 +440,21 @@ class DiversityDataGenerator:
         Returns:
             A string containing the formatted input for the question generation model.
         """
-        # Apply token management to the cluster
-        managed_cluster = self._manage_cluster_tokens(cluster, max_total_tokens=50000)
+        # Use the cluster as-is if it's already been chunked, otherwise apply token management
+        if "chunk_info" in cluster:
+            managed_cluster = cluster
+            logger.info(f"Using pre-chunked cluster: {cluster['chunk_info']}")
+        else:
+            managed_cluster = self._manage_cluster_tokens(cluster, max_total_tokens=20000)
         
         entity = managed_cluster["entity_name"]
         entity_desc = managed_cluster["entity_description"]
         entity_desc = f"Entity'{entity}'：{entity_desc}"
+        
+        # Add chunk information to entity description if available
+        if "chunk_info" in managed_cluster:
+            entity_desc += f" ({managed_cluster['chunk_info']})"
+            
         tmpl = f""""For {entity_desc}, here is the relevant content from my interactions with the AI robot:\n"""
         chunk_tmpl = ""
         for ind, entity_dict in enumerate(managed_cluster["note"]):
@@ -382,7 +473,7 @@ class DiversityDataGenerator:
         
         # Log final token usage for monitoring
         total_tokens = self._count_tokens(tmpl)
-        logger.debug(f"Generated Q_input with {total_tokens} tokens for cluster '{entity}'")
+        logger.info(f"Generated Q_input with {total_tokens} tokens for cluster '{entity}' ({managed_cluster.get('chunk_info', 'no chunk info')})")
 
         return tmpl
 
@@ -523,9 +614,34 @@ class DiversityDataGenerator:
         Returns:
             List of generated QA data.
         """
+        # Step 1: Apply chunking to large clusters to prevent token overflow
+        processed_clusters = []
+        for cluster in clusters:
+            notes = cluster.get("note", [])
+            if len(notes) > 0:
+                # Estimate total tokens for this cluster
+                total_tokens = 0
+                for note in notes:
+                    if "processed" in note:
+                        content = note["processed"]
+                    else:
+                        content = f"Title: {note.get('title', '')}\nContent: {note.get('content', '')}\nAI Insight: {note.get('insight', '')}"
+                    total_tokens += self._count_tokens(content)
+                
+                # If cluster is too large, chunk it
+                if total_tokens > 12000:  # Conservative threshold before template overhead
+                    chunks = self._create_cluster_chunks(cluster, max_chunk_tokens=15000, template_reserve=8000)
+                    processed_clusters.extend(chunks)
+                    logger.info(f"Chunked cluster '{cluster.get('entity_name', 'unknown')}' from {total_tokens} tokens into {len(chunks)} chunks")
+                else:
+                    processed_clusters.append(cluster)
+            else:
+                processed_clusters.append(cluster)
+        
+        # Step 2: Explode clusters for augmentation
         explode_clusters = []
         explode_questions_types = []
-        for item in clusters:
+        for item in processed_clusters:
             # add elements multiple times based on aug_para
             explode_clusters.extend([item] * aug_para)
             # randomly select different types based on weights
@@ -534,7 +650,9 @@ class DiversityDataGenerator:
             explode_questions_types.extend(random_types)
 
         logger.info("Start generating data")
-        logger.info(f"Explode clusters: {len(explode_clusters)}")
+        logger.info(f"Original clusters: {len(clusters)}")
+        logger.info(f"After chunking: {len(processed_clusters)} chunks")
+        logger.info(f"Exploded clusters: {len(explode_clusters)}")
         logger.info(f"Explode questions types: {len(explode_questions_types)}")
 
         questions, answers, answer_types, flat_question_types, flat_clusters = self._generate(
@@ -548,11 +666,17 @@ class DiversityDataGenerator:
         ):
             if len(question) == 0 or len(answer) == 0:
                 continue
+            
+            # Include chunk information in the data if available
+            entity_name = cluster["entity_name"]
+            if "chunk_info" in cluster:
+                entity_name = f"{entity_name}_{cluster['chunk_info']}"
+            
             data.append(
                 {
                     "user": question,
                     "assistant": answer,
-                    "entity_name": cluster["entity_name"],
+                    "entity_name": entity_name,
                     "question_type": question_type,
                     "answer_type": answer_type,
                     "doc_id": cluster["doc_id"],
@@ -654,32 +778,19 @@ class DiversityDataGenerator:
             {"role": "user", "content": user_input + language_desc},
         ]
         
-        # Log token usage before API call for debugging
+        # Log token usage for monitoring (chunking should prevent most overflows)
         system_tokens = self._count_tokens(system_prompt)
         user_tokens = self._count_tokens(user_input + language_desc)
         total_tokens = system_tokens + user_tokens
         
-        if total_tokens > 120000:  # Close to 128k limit
-            logger.warning(f"High token count for cluster '{cluster.get('entity_name', 'unknown')}': "
-                          f"system={system_tokens}, user={user_tokens}, total={total_tokens}")
-            
-            # Emergency fallback: aggressively truncate user input if total is too high
-            if total_tokens > 125000:
-                logger.error(f"Token count {total_tokens} exceeds safe limit! Applying emergency truncation.")
-                # Calculate how much we need to cut from user input
-                target_user_tokens = 125000 - system_tokens - 1000  # Leave 1k buffer
-                if target_user_tokens > 0:
-                    # Truncate user input to fit
-                    user_content = user_input + language_desc
-                    # Rough truncation - take first portion that fits
-                    approx_chars_per_token = len(user_content) / max(user_tokens, 1)
-                    target_chars = int(target_user_tokens * approx_chars_per_token * 0.9)  # 90% safety margin
-                    truncated_user_content = user_content[:target_chars] + "\n[EMERGENCY TRUNCATION APPLIED]"
-                    messages[1]["content"] = truncated_user_content
-                    logger.warning(f"Truncated user input from {len(user_content)} to {len(truncated_user_content)} chars")
-                else:
-                    logger.error("System prompt alone exceeds token limits! Skipping this request.")
-                    return []
+        logger.info(f"Q_generate tokens for '{cluster.get('entity_name', 'unknown')}': "
+                   f"system={system_tokens}, user={user_tokens}, total={total_tokens}")
+        
+        # Emergency safety check - this should rarely trigger with chunking
+        if total_tokens > 120000:  # Much higher threshold since chunking prevents most issues
+            logger.error(f"EMERGENCY: Token count {total_tokens} exceeds model limit! "
+                        f"Chunking failed for cluster '{cluster.get('entity_name', 'unknown')}'")
+            return []
         
         res = ""  # Initialize res to handle API failures gracefully
         try:
@@ -738,32 +849,18 @@ class DiversityDataGenerator:
             {"role": "user", "content": user_input + language_desc},
         ]
         
-        # Log token usage before API call for debugging
+        # Log token usage for monitoring (chunking should prevent most overflows)
         system_tokens = self._count_tokens(system_prompt)
         user_tokens = self._count_tokens(user_input + language_desc)
         total_tokens = system_tokens + user_tokens
         
-        if total_tokens > 120000:  # Close to 128k limit
-            logger.warning(f"High token count for answer generation: "
-                          f"system={system_tokens}, user={user_tokens}, total={total_tokens}")
-            
-            # Emergency fallback: aggressively truncate user input if total is too high
-            if total_tokens > 125000:
-                logger.error(f"Answer generation token count {total_tokens} exceeds safe limit! Applying emergency truncation.")
-                # Calculate how much we need to cut from user input
-                target_user_tokens = 125000 - system_tokens - 1000  # Leave 1k buffer
-                if target_user_tokens > 0:
-                    # Truncate user input to fit
-                    user_content = user_input + language_desc
-                    # Rough truncation - take first portion that fits
-                    approx_chars_per_token = len(user_content) / max(user_tokens, 1)
-                    target_chars = int(target_user_tokens * approx_chars_per_token * 0.9)  # 90% safety margin
-                    truncated_user_content = user_content[:target_chars] + "\n[EMERGENCY TRUNCATION APPLIED]"
-                    messages[1]["content"] = truncated_user_content
-                    logger.warning(f"Truncated answer user input from {len(user_content)} to {len(truncated_user_content)} chars")
-                else:
-                    logger.error("System prompt alone exceeds token limits for answers! Returning error response.")
-                    return "[ERROR: System prompt too large]", answer_type
+        logger.info(f"A_generate tokens for answer generation: "
+                   f"system={system_tokens}, user={user_tokens}, total={total_tokens}")
+        
+        # Emergency safety check - this should rarely trigger with chunking
+        if total_tokens > 120000:  # Much higher threshold since chunking prevents most issues
+            logger.error(f"EMERGENCY: Answer generation token count {total_tokens} exceeds model limit!")
+            return "[ERROR: Content too large despite chunking]", answer_type
         
         res = ""  # Initialize res to handle API failures gracefully
         try:
