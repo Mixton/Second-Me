@@ -178,7 +178,7 @@ class DiversityDataGenerator:
         
         return result_dict
 
-    def _manage_cluster_tokens(self, cluster: dict, max_total_tokens: int = 100000) -> dict:
+    def _manage_cluster_tokens(self, cluster: dict, max_total_tokens: int = 50000) -> dict:
         """Manage token limits for a cluster of notes.
         
         Args:
@@ -192,12 +192,13 @@ class DiversityDataGenerator:
         if not notes:
             return cluster
         
-        # Reserve space for template text, entity info, and output
-        available_tokens = max_total_tokens - 3000
+        # Reserve more space for template text, entity info, system prompts and output
+        # Being very conservative due to large template prompts
+        available_tokens = max_total_tokens - 10000
         
-        # Calculate tokens per note
+        # Calculate tokens per note - be more aggressive with limits
         max_tokens_per_note = available_tokens // len(notes)
-        max_tokens_per_note = max(500, min(max_tokens_per_note, 8000))  # Min 500, max 8k per note
+        max_tokens_per_note = max(300, min(max_tokens_per_note, 3000))  # Reduced: Min 300, max 3k per note
         
         logger.debug(f"Managing cluster '{cluster.get('entity_name', 'unknown')}' with {len(notes)} notes, {max_tokens_per_note} tokens each")
         
@@ -313,7 +314,7 @@ class DiversityDataGenerator:
             A string containing the formatted input for the answer generation model.
         """
         # Apply token management to the cluster
-        managed_cluster = self._manage_cluster_tokens(cluster, max_total_tokens=100000)
+        managed_cluster = self._manage_cluster_tokens(cluster, max_total_tokens=50000)
         
         entity = managed_cluster["entity_name"]
         entity_desc = managed_cluster["entity_description"]
@@ -358,7 +359,7 @@ class DiversityDataGenerator:
             A string containing the formatted input for the question generation model.
         """
         # Apply token management to the cluster
-        managed_cluster = self._manage_cluster_tokens(cluster, max_total_tokens=100000)
+        managed_cluster = self._manage_cluster_tokens(cluster, max_total_tokens=50000)
         
         entity = managed_cluster["entity_name"]
         entity_desc = managed_cluster["entity_description"]
@@ -644,15 +645,42 @@ class DiversityDataGenerator:
         """
         user_input = self._get_Q_input(cluster, user_name)
 
+        system_prompt = templater.get_Q_template(
+            question_type_prompt=q_dict[question_type]["prompt"]
+        )
+        
         messages = [
-            {
-                "role": "system",
-                "content": templater.get_Q_template(
-                    question_type_prompt=q_dict[question_type]["prompt"]
-                ),
-            },
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_input + language_desc},
         ]
+        
+        # Log token usage before API call for debugging
+        system_tokens = self._count_tokens(system_prompt)
+        user_tokens = self._count_tokens(user_input + language_desc)
+        total_tokens = system_tokens + user_tokens
+        
+        if total_tokens > 120000:  # Close to 128k limit
+            logger.warning(f"High token count for cluster '{cluster.get('entity_name', 'unknown')}': "
+                          f"system={system_tokens}, user={user_tokens}, total={total_tokens}")
+            
+            # Emergency fallback: aggressively truncate user input if total is too high
+            if total_tokens > 125000:
+                logger.error(f"Token count {total_tokens} exceeds safe limit! Applying emergency truncation.")
+                # Calculate how much we need to cut from user input
+                target_user_tokens = 125000 - system_tokens - 1000  # Leave 1k buffer
+                if target_user_tokens > 0:
+                    # Truncate user input to fit
+                    user_content = user_input + language_desc
+                    # Rough truncation - take first portion that fits
+                    approx_chars_per_token = len(user_content) / max(user_tokens, 1)
+                    target_chars = int(target_user_tokens * approx_chars_per_token * 0.9)  # 90% safety margin
+                    truncated_user_content = user_content[:target_chars] + "\n[EMERGENCY TRUNCATION APPLIED]"
+                    messages[1]["content"] = truncated_user_content
+                    logger.warning(f"Truncated user input from {len(user_content)} to {len(truncated_user_content)} chars")
+                else:
+                    logger.error("System prompt alone exceeds token limits! Skipping this request.")
+                    return []
+        
         res = ""  # Initialize res to handle API failures gracefully
         try:
             response = self.client.chat.completions.create(
@@ -704,10 +732,39 @@ class DiversityDataGenerator:
         """
         user_input = self._get_A_input(cluster, question, user_name)
         system_prompt, answer_type = templater.get_A_template(question_type)
+        
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_input + language_desc},
         ]
+        
+        # Log token usage before API call for debugging
+        system_tokens = self._count_tokens(system_prompt)
+        user_tokens = self._count_tokens(user_input + language_desc)
+        total_tokens = system_tokens + user_tokens
+        
+        if total_tokens > 120000:  # Close to 128k limit
+            logger.warning(f"High token count for answer generation: "
+                          f"system={system_tokens}, user={user_tokens}, total={total_tokens}")
+            
+            # Emergency fallback: aggressively truncate user input if total is too high
+            if total_tokens > 125000:
+                logger.error(f"Answer generation token count {total_tokens} exceeds safe limit! Applying emergency truncation.")
+                # Calculate how much we need to cut from user input
+                target_user_tokens = 125000 - system_tokens - 1000  # Leave 1k buffer
+                if target_user_tokens > 0:
+                    # Truncate user input to fit
+                    user_content = user_input + language_desc
+                    # Rough truncation - take first portion that fits
+                    approx_chars_per_token = len(user_content) / max(user_tokens, 1)
+                    target_chars = int(target_user_tokens * approx_chars_per_token * 0.9)  # 90% safety margin
+                    truncated_user_content = user_content[:target_chars] + "\n[EMERGENCY TRUNCATION APPLIED]"
+                    messages[1]["content"] = truncated_user_content
+                    logger.warning(f"Truncated answer user input from {len(user_content)} to {len(truncated_user_content)} chars")
+                else:
+                    logger.error("System prompt alone exceeds token limits for answers! Returning error response.")
+                    return "[ERROR: System prompt too large]", answer_type
+        
         res = ""  # Initialize res to handle API failures gracefully
         try:
             response = self.client.chat.completions.create(
