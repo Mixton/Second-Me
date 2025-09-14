@@ -10,6 +10,7 @@ import openai
 import pandas as pd
 from tqdm import tqdm
 from enum import Enum
+import tiktoken
 from lpm_kernel.api.services.user_llm_config_service import UserLLMConfigService
 from lpm_kernel.configs.config import Config
 from lpm_kernel.L2.data_pipeline.data_prep.diversity.utils import remove_similar_dicts
@@ -77,7 +78,154 @@ class DiversityDataGenerator:
             else:
                 logger.error(f"Error model_name, longcot data generating model_name: deepseek series")
                 raise
+        
+        # Initialize tokenizer for token management
+        try:
+            self.tokenizer = tiktoken.get_encoding("cl100k_base")
+        except:
+            logger.warning("Could not initialize tiktoken, falling back to character counting")
+            self.tokenizer = None
 
+    def _count_tokens(self, text: str) -> int:
+        """Count tokens in a text string."""
+        if self.tokenizer:
+            return len(self.tokenizer.encode(text))
+        else:
+            # Fallback to character count estimation (roughly 4 chars per token)
+            return len(text) // 4
+
+    def _truncate_note_content(self, note_dict: dict, max_tokens: int) -> dict:
+        """Intelligently truncate a note's content to fit within token limits.
+        
+        Args:
+            note_dict: The note dictionary to truncate
+            max_tokens: Maximum tokens allowed for this note
+            
+        Returns:
+            Truncated note dictionary
+        """
+        # Extract note content based on available fields
+        if "processed" in note_dict:
+            content = note_dict["processed"]
+        else:
+            title = note_dict.get("title", "")
+            content_body = note_dict.get("content", "")
+            insight = note_dict.get("insight", "")
+            content = f"Title: {title}\nContent: {content_body}\nAI Insight: {insight}"
+        
+        if self._count_tokens(content) <= max_tokens:
+            # Return copy of original if within limits
+            return note_dict.copy()
+            
+        # Truncate content intelligently
+        lines = content.split('\n')
+        result_lines = []
+        current_tokens = 0
+        
+        # Always include title line if present
+        if lines and lines[0].startswith("Title:"):
+            title_line = lines[0]
+            title_tokens = self._count_tokens(title_line)
+            if title_tokens <= max_tokens - 100:  # Leave room for content
+                result_lines.append(title_line)
+                current_tokens += title_tokens
+                lines = lines[1:]
+        
+        # Add remaining lines until we hit the token limit
+        for line in lines:
+            line_tokens = self._count_tokens(line + '\n')
+            if current_tokens + line_tokens > max_tokens - 50:  # Leave buffer
+                break
+            result_lines.append(line)
+            current_tokens += line_tokens
+        
+        # Add truncation indicator
+        if len(result_lines) < len(content.split('\n')):
+            result_lines.append("[CONTENT TRUNCATED FOR TOKEN LIMITS]")
+        
+        truncated_content = '\n'.join(result_lines)
+        
+        # Return modified copy of note_dict
+        result_dict = note_dict.copy()
+        if "processed" in result_dict:
+            result_dict["processed"] = truncated_content
+        else:
+            # Reconstruct the truncated components
+            truncated_lines = truncated_content.split('\n')
+            new_title = ""
+            new_content = ""
+            new_insight = ""
+            
+            current_section = "title"
+            for line in truncated_lines:
+                if line.startswith("Title: "):
+                    new_title = line[7:]  # Remove "Title: " prefix
+                    current_section = "content"
+                elif line.startswith("Content: "):
+                    new_content = line[9:]  # Remove "Content: " prefix
+                    current_section = "content"
+                elif line.startswith("AI Insight: "):
+                    new_insight = line[12:]  # Remove "AI Insight: " prefix
+                    current_section = "insight"
+                elif current_section == "content":
+                    new_content += "\n" + line if new_content else line
+                elif current_section == "insight":
+                    new_insight += "\n" + line if new_insight else line
+            
+            result_dict["title"] = new_title or result_dict.get("title", "")
+            result_dict["content"] = new_content or result_dict.get("content", "")
+            result_dict["insight"] = new_insight or result_dict.get("insight", "")
+        
+        return result_dict
+
+    def _manage_cluster_tokens(self, cluster: dict, max_total_tokens: int = 100000) -> dict:
+        """Manage token limits for a cluster of notes.
+        
+        Args:
+            cluster: The cluster containing notes to process
+            max_total_tokens: Maximum total tokens for all notes in the cluster
+            
+        Returns:
+            Modified cluster with token-managed notes
+        """
+        notes = cluster.get("note", [])
+        if not notes:
+            return cluster
+        
+        # Reserve space for template text, entity info, and output
+        available_tokens = max_total_tokens - 3000
+        
+        # Calculate tokens per note
+        max_tokens_per_note = available_tokens // len(notes)
+        max_tokens_per_note = max(500, min(max_tokens_per_note, 8000))  # Min 500, max 8k per note
+        
+        logger.debug(f"Managing cluster '{cluster.get('entity_name', 'unknown')}' with {len(notes)} notes, {max_tokens_per_note} tokens each")
+        
+        # Process each note
+        managed_notes = []
+        total_tokens = 0
+        
+        for note_dict in notes:
+            managed_note = self._truncate_note_content(note_dict, max_tokens_per_note)
+            managed_notes.append(managed_note)
+            
+            # Count tokens for logging
+            if "processed" in managed_note:
+                note_tokens = self._count_tokens(managed_note["processed"])
+            else:
+                content = f"Title: {managed_note.get('title', '')}\nContent: {managed_note.get('content', '')}\nAI Insight: {managed_note.get('insight', '')}"
+                note_tokens = self._count_tokens(content)
+            total_tokens += note_tokens
+        
+        # Create modified cluster
+        managed_cluster = cluster.copy()
+        managed_cluster["note"] = managed_notes
+        
+        logger.debug(f"Cluster token usage: {total_tokens} tokens for {len(managed_notes)} notes")
+        
+        return managed_cluster
+
+        
 
     def _preprocess(self, entities_path: str, note_list: list, config_path: str, graph_path: str, user_name: str):
         """Preprocess the input data for diversity generation.
@@ -164,14 +312,17 @@ class DiversityDataGenerator:
         Returns:
             A string containing the formatted input for the answer generation model.
         """
-        entity = cluster["entity_name"]
-        entity_desc = cluster["entity_description"]
+        # Apply token management to the cluster
+        managed_cluster = self._manage_cluster_tokens(cluster, max_total_tokens=100000)
+        
+        entity = managed_cluster["entity_name"]
+        entity_desc = managed_cluster["entity_description"]
         entity_desc = f"Entity'{entity}',Relevant Info：'{entity_desc}'"
 
         tmpl = f"""I am {user_name}. Regarding {entity_desc}, here is some information I previously mentioned:\n\n"""
 
         chunk_tmpl = ""
-        for ind, entity_dict in enumerate(cluster["note"]):
+        for ind, entity_dict in enumerate(managed_cluster["note"]):
             if "processed" in entity_dict:
                 content = entity_dict["processed"]
             else:
@@ -188,6 +339,10 @@ class DiversityDataGenerator:
             + chunk_tmpl
             + f"Based on the information I have previously recorded, please answer '{question}'. Note that you need to ensure the perspective is consistent, meaning that all instances of {user_name} should be replaced with the second person 'you'."
         )
+        
+        # Log final token usage for monitoring
+        total_tokens = self._count_tokens(tmpl)
+        logger.debug(f"Generated A_input with {total_tokens} tokens for cluster '{entity}'")
 
         return tmpl
 
@@ -202,12 +357,15 @@ class DiversityDataGenerator:
         Returns:
             A string containing the formatted input for the question generation model.
         """
-        entity = cluster["entity_name"]
-        entity_desc = cluster["entity_description"]
+        # Apply token management to the cluster
+        managed_cluster = self._manage_cluster_tokens(cluster, max_total_tokens=100000)
+        
+        entity = managed_cluster["entity_name"]
+        entity_desc = managed_cluster["entity_description"]
         entity_desc = f"Entity'{entity}'：{entity_desc}"
         tmpl = f""""For {entity_desc}, here is the relevant content from my interactions with the AI robot:\n"""
         chunk_tmpl = ""
-        for ind, entity_dict in enumerate(cluster["note"]):
+        for ind, entity_dict in enumerate(managed_cluster["note"]):
             content = entity_dict["content"]
             title = entity_dict["title"]
             insight = entity_dict["insight"]
@@ -220,6 +378,10 @@ class DiversityDataGenerator:
             + chunk_tmpl
             + f"Please help me generate questions; note that you need to phrase them from my perspective, meaning all expressions of {user_name} should be replaced with the first person 'I'."
         )
+        
+        # Log final token usage for monitoring
+        total_tokens = self._count_tokens(tmpl)
+        logger.debug(f"Generated Q_input with {total_tokens} tokens for cluster '{entity}'")
 
         return tmpl
 
@@ -491,6 +653,7 @@ class DiversityDataGenerator:
             },
             {"role": "user", "content": user_input + language_desc},
         ]
+        res = ""  # Initialize res to handle API failures gracefully
         try:
             response = self.client.chat.completions.create(
                 model=self.model_name,
@@ -502,13 +665,16 @@ class DiversityDataGenerator:
             else:
                 res = response.choices[0].message.content
         except Exception as e:
-            logging.error(traceback.format_exc())
+            logger.error(f"API call failed for cluster '{cluster.get('entity_name', 'unknown')}': {str(e)}")
+            logger.error(traceback.format_exc())
+            return []  # Return empty list on API failure
         
         # post-processing
         try:
             pattern = r"Question\s*\d+\s*:\s*(.*?)\|\|"
             questions = re.findall(pattern, res + "||")
         except Exception as e:
+            logger.error(f"Failed to parse questions from response: {str(e)}")
             logger.error(traceback.format_exc())
             questions = []
             return questions
@@ -542,6 +708,7 @@ class DiversityDataGenerator:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_input + language_desc},
         ]
+        res = ""  # Initialize res to handle API failures gracefully
         try:
             response = self.client.chat.completions.create(
                 model=self.model_name,
@@ -553,6 +720,8 @@ class DiversityDataGenerator:
             else:
                 res = response.choices[0].message.content
         except Exception as e:
+            logger.error(f"API call failed for answer generation: {str(e)}")
             logging.error(traceback.format_exc())
+            res = "[ERROR: Could not generate answer due to API failure]"
             
         return res, answer_type
