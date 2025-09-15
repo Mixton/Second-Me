@@ -95,6 +95,116 @@ class DiversityDataGenerator:
             # Fallback to character count estimation (roughly 4 chars per token)
             return len(text) // 4
 
+    def _split_large_note(self, note_dict: dict, max_tokens: int) -> List[dict]:
+        """Split a large note into multiple smaller notes to preserve all content.
+        
+        Args:
+            note_dict: The note dictionary to split
+            max_tokens: Maximum tokens allowed per note chunk
+            
+        Returns:
+            List of note chunks, each within token limits
+        """
+        # Extract note content based on available fields
+        if "processed" in note_dict:
+            content = note_dict["processed"]
+            content_field = "processed"
+        else:
+            title = note_dict.get("title", "")
+            content_body = note_dict.get("content", "")
+            insight = note_dict.get("insight", "")
+            content = f"Title: {title}\nContent: {content_body}\nAI Insight: {insight}"
+            content_field = None
+        
+        total_tokens = self._count_tokens(content)
+        if total_tokens <= max_tokens:
+            # Return original if within limits
+            return [note_dict.copy()]
+        
+        # Split content into chunks
+        lines = content.split('\n')
+        chunks = []
+        current_chunk_lines = []
+        current_tokens = 0
+        
+        # Reserve tokens for metadata (title, chunk info, etc.)
+        available_tokens = max_tokens - 200
+        
+        # Always include title in first chunk if present
+        title_lines = []
+        if lines and lines[0].startswith("Title:"):
+            title_lines.append(lines[0])
+            title_tokens = self._count_tokens(lines[0])
+            if title_tokens < available_tokens:
+                current_chunk_lines.append(lines[0])
+                current_tokens = title_tokens
+                lines = lines[1:]
+        
+        chunk_num = 1
+        for line in lines:
+            line_tokens = self._count_tokens(line + '\n')
+            
+            # Check if adding this line would exceed chunk limit
+            if current_chunk_lines and (current_tokens + line_tokens > available_tokens):
+                # Finalize current chunk
+                chunk_content = '\n'.join(current_chunk_lines)
+                if chunk_num > 1:
+                    # Add chunk indicator and title reference for context
+                    chunk_content = f"[NOTE CHUNK {chunk_num}/{chunk_num}+] {title_lines[0] if title_lines else ''}\n{chunk_content}"
+                
+                chunk = note_dict.copy()
+                if content_field:
+                    chunk[content_field] = chunk_content
+                else:
+                    # Parse back into structured format
+                    chunk["title"] = f"{chunk.get('title', '')} (Part {chunk_num})"
+                    chunk["content"] = chunk_content
+                    chunk["insight"] = f"Chunk {chunk_num} of large note"
+                
+                chunks.append(chunk)
+                
+                # Start new chunk
+                current_chunk_lines = []
+                current_tokens = 0
+                chunk_num += 1
+                
+                # Add title reference to new chunk for context
+                if title_lines:
+                    current_chunk_lines.extend(title_lines)
+                    current_tokens = self._count_tokens('\n'.join(title_lines))
+            
+            # Add line to current chunk
+            current_chunk_lines.append(line)
+            current_tokens += line_tokens
+        
+        # Add final chunk if it has content
+        if current_chunk_lines:
+            chunk_content = '\n'.join(current_chunk_lines)
+            if chunk_num > 1:
+                # Update all previous chunks to show correct total
+                for prev_chunk in chunks:
+                    if content_field:
+                        prev_content = prev_chunk[content_field]
+                        prev_content = prev_content.replace(f"/{chunk_num}+]", f"/{chunk_num}]")
+                        prev_chunk[content_field] = prev_content
+                    else:
+                        prev_chunk["insight"] = f"Chunk {chunks.index(prev_chunk)+1} of {chunk_num}"
+                
+                chunk_content = f"[NOTE CHUNK {chunk_num}/{chunk_num}] {title_lines[0] if title_lines else ''}\n{chunk_content}"
+            
+            chunk = note_dict.copy()
+            if content_field:
+                chunk[content_field] = chunk_content
+            else:
+                chunk["title"] = f"{chunk.get('title', '')} (Part {chunk_num})" if chunk_num > 1 else chunk.get('title', '')
+                chunk["content"] = chunk_content
+                chunk["insight"] = f"Chunk {chunk_num} of {chunk_num}" if chunk_num > 1 else chunk.get("insight", "")
+            
+            chunks.append(chunk)
+        
+        logger.info(f"Split large note ({total_tokens} tokens) into {len(chunks)} chunks")
+        return chunks
+
     def _truncate_note_content(self, note_dict: dict, max_tokens: int) -> dict:
         """Intelligently truncate a note's content to fit within token limits.
         
@@ -212,15 +322,39 @@ class DiversityDataGenerator:
             
             note_tokens = self._count_tokens(content)
             
-            # If this single note exceeds chunk limits, truncate it
+            # If this single note exceeds chunk limits, split it instead of truncating
             if note_tokens > available_tokens_per_chunk:
-                logger.warning(f"Note exceeds chunk limit ({note_tokens} > {available_tokens_per_chunk}), truncating")
-                truncated_note = self._truncate_note_content(note_dict, available_tokens_per_chunk)
-                note_dict = truncated_note
-                note_tokens = self._count_tokens(
-                    truncated_note.get("processed", 
-                    f"Title: {truncated_note.get('title', '')}\nContent: {truncated_note.get('content', '')}\nAI Insight: {truncated_note.get('insight', '')}")
-                )
+                logger.info(f"Note exceeds chunk limit ({note_tokens} > {available_tokens_per_chunk}), splitting into sub-notes")
+                note_chunks = self._split_large_note(note_dict, available_tokens_per_chunk)
+                
+                # Process each note chunk
+                for note_chunk in note_chunks:
+                    # Recalculate tokens for the chunk
+                    if "processed" in note_chunk:
+                        chunk_content = note_chunk["processed"]
+                    else:
+                        chunk_content = f"Title: {note_chunk.get('title', '')}\nContent: {note_chunk.get('content', '')}\nAI Insight: {note_chunk.get('insight', '')}"
+                    
+                    chunk_tokens = self._count_tokens(chunk_content)
+                    
+                    # Check if adding this note chunk would exceed chunk limit
+                    if current_chunk_notes and (current_chunk_tokens + chunk_tokens > available_tokens_per_chunk):
+                        # Finalize current chunk
+                        chunk = cluster.copy()
+                        chunk["note"] = current_chunk_notes.copy()
+                        chunk["chunk_info"] = f"chunk_{len(chunks)+1}_of_multiple"
+                        chunks.append(chunk)
+                        logger.info(f"Created chunk {len(chunks)} with {len(current_chunk_notes)} notes, {current_chunk_tokens} tokens")
+                        
+                        # Start new chunk
+                        current_chunk_notes = []
+                        current_chunk_tokens = 0
+                    
+                    # Add note chunk to current chunk
+                    current_chunk_notes.append(note_chunk)
+                    current_chunk_tokens += chunk_tokens
+                
+                continue  # Skip the original processing for this note
             
             # Check if adding this note would exceed chunk limit
             if current_chunk_notes and (current_chunk_tokens + note_tokens > available_tokens_per_chunk):
@@ -276,21 +410,51 @@ class DiversityDataGenerator:
         
         logger.info(f"Managing cluster '{cluster.get('entity_name', 'unknown')}' with {len(notes)} notes, {max_tokens_per_note} tokens each (max_total: {max_total_tokens})")
         
-        # Process each note
+        # Process each note - use splitting for preservation, truncation only as fallback
         managed_notes = []
         total_tokens = 0
         
         for note_dict in notes:
-            managed_note = self._truncate_note_content(note_dict, max_tokens_per_note)
-            managed_notes.append(managed_note)
-            
-            # Count tokens for logging
-            if "processed" in managed_note:
-                note_tokens = self._count_tokens(managed_note["processed"])
+            # Calculate current note size
+            if "processed" in note_dict:
+                content = note_dict["processed"]
             else:
-                content = f"Title: {managed_note.get('title', '')}\nContent: {managed_note.get('content', '')}\nAI Insight: {managed_note.get('insight', '')}"
-                note_tokens = self._count_tokens(content)
-            total_tokens += note_tokens
+                content = f"Title: {note_dict.get('title', '')}\nContent: {note_dict.get('content', '')}\nAI Insight: {note_dict.get('insight', '')}"
+            
+            note_tokens = self._count_tokens(content)
+            
+            # If note is too large, try splitting first
+            if note_tokens > max_tokens_per_note:
+                logger.info(f"Note exceeds token limit ({note_tokens} > {max_tokens_per_note}), attempting to split")
+                note_chunks = self._split_large_note(note_dict, max_tokens_per_note)
+                
+                # Check if splitting would create too many notes for this cluster
+                if len(managed_notes) + len(note_chunks) <= len(notes) * 2:  # Allow up to 2x notes through splitting
+                    managed_notes.extend(note_chunks)
+                    # Count tokens for all chunks
+                    for chunk in note_chunks:
+                        if "processed" in chunk:
+                            chunk_content = chunk["processed"]
+                        else:
+                            chunk_content = f"Title: {chunk.get('title', '')}\nContent: {chunk.get('content', '')}\nAI Insight: {chunk.get('insight', '')}"
+                        total_tokens += self._count_tokens(chunk_content)
+                else:
+                    # Fallback to truncation if splitting creates too many notes
+                    logger.warning(f"Splitting would create too many notes, falling back to truncation")
+                    managed_note = self._truncate_note_content(note_dict, max_tokens_per_note)
+                    managed_notes.append(managed_note)
+                    
+                    # Count tokens for truncated note
+                    if "processed" in managed_note:
+                        note_tokens = self._count_tokens(managed_note["processed"])
+                    else:
+                        truncated_content = f"Title: {managed_note.get('title', '')}\nContent: {managed_note.get('content', '')}\nAI Insight: {managed_note.get('insight', '')}"
+                        note_tokens = self._count_tokens(truncated_content)
+                    total_tokens += note_tokens
+            else:
+                # Note is within limits, use as-is
+                managed_notes.append(note_dict.copy())
+                total_tokens += note_tokens
         
         # Create modified cluster
         managed_cluster = cluster.copy()
