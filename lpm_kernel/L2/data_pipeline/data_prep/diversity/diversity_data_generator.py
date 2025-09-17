@@ -6,6 +6,10 @@ import random
 import re
 import traceback
 from typing import List
+import hashlib
+import pickle
+from pathlib import Path
+import time
 
 import openai
 import pandas as pd
@@ -47,11 +51,14 @@ class DiversityDataGenerator:
     entities, and configurations. It leverages LLMs to generate questions and answers.
     """
     
-    def __init__(self, preference_language: str, is_cot: bool = True):
+    def __init__(self, preference_language: str, is_cot: bool = True, cache_dir: str = None, enable_cache: bool = True):
         """Initialize the diversity data generator.
         
         Args:
             preference_language: The language to use for generating data.
+            is_cot: Whether to use chain of thought pattern.
+            cache_dir: Directory to store cache files. If None, uses default cache directory.
+            enable_cache: Whether to enable caching functionality.
         """
         user_llm_config_service = UserLLMConfigService()
         user_llm_config = user_llm_config_service.get_available_llm()
@@ -86,6 +93,31 @@ class DiversityDataGenerator:
         except:
             logger.warning("Could not initialize tiktoken, falling back to character counting")
             self.tokenizer = None
+            
+        # Initialize cache system
+        self.enable_cache = enable_cache
+        if cache_dir is None:
+            self.cache_dir = Path("cache/diversity_data_generator")
+        else:
+            self.cache_dir = Path(cache_dir)
+        
+        if self.enable_cache:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            self.preprocess_cache_dir = self.cache_dir / "preprocess_cache"
+            self.dedup_cache_dir = self.preprocess_cache_dir / "dedup_cache"
+            self.pipeline_cache_dir = self.cache_dir / "pipeline_cache"
+            self.llm_cache_dir = self.cache_dir / "llm_call_cache"
+            self.question_cache_dir = self.llm_cache_dir / "questions"
+            self.answer_cache_dir = self.llm_cache_dir / "answers"
+            
+            # Create all cache directories
+            for cache_path in [self.preprocess_cache_dir, self.dedup_cache_dir, 
+                              self.pipeline_cache_dir, self.question_cache_dir, self.answer_cache_dir]:
+                cache_path.mkdir(parents=True, exist_ok=True)
+                
+            logger.info(f"Cache system enabled. Cache directory: {self.cache_dir}")
+        else:
+            logger.info("Cache system disabled")
 
     def _count_tokens(self, text: str) -> int:
         """Count tokens in a text string."""
@@ -94,6 +126,137 @@ class DiversityDataGenerator:
         else:
             # Fallback to character count estimation (roughly 4 chars per token)
             return len(text) // 4
+
+    def _generate_hash(self, *args) -> str:
+        """Generate a hash from multiple arguments."""
+        combined = json.dumps(args, sort_keys=True, ensure_ascii=False)
+        return hashlib.md5(combined.encode('utf-8')).hexdigest()
+    
+    def _save_cache(self, cache_path: Path, data):
+        """Save data to cache file."""
+        if not self.enable_cache:
+            return
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(cache_path, 'wb') as f:
+                pickle.dump(data, f)
+            logger.debug(f"Saved cache: {cache_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save cache {cache_path}: {e}")
+    
+    def _load_cache(self, cache_path: Path):
+        """Load data from cache file."""
+        if not self.enable_cache or not cache_path.exists():
+            return None
+        try:
+            with open(cache_path, 'rb') as f:
+                data = pickle.load(f)
+            logger.debug(f"Loaded cache: {cache_path}")
+            return data
+        except Exception as e:
+            logger.warning(f"Failed to load cache {cache_path}: {e}")
+            return None
+    
+    def _get_input_hash(self, entities_path: str, note_list: list, config_path: str, graph_path: str, user_name: str) -> str:
+        """Generate hash for preprocess input parameters."""
+        # Create hash from file modification times and input parameters
+        try:
+            entities_mtime = os.path.getmtime(entities_path) if os.path.exists(entities_path) else 0
+            config_mtime = os.path.getmtime(config_path) if os.path.exists(config_path) else 0
+            graph_mtime = os.path.getmtime(graph_path) if os.path.exists(graph_path) else 0
+            
+            # For note_list, create a hash of the content
+            note_content_hash = self._generate_hash([item.to_json() if hasattr(item, 'to_json') else str(item) for item in note_list])
+            
+            return self._generate_hash(entities_path, entities_mtime, config_path, config_mtime, 
+                                     graph_path, graph_mtime, user_name, note_content_hash)
+        except Exception as e:
+            logger.warning(f"Failed to generate input hash: {e}")
+            return self._generate_hash(entities_path, config_path, graph_path, user_name, str(note_list))
+    
+    def _clean_cache(self, job_id: str = None):
+        """Clean cache files. If job_id is provided, only clean that specific job's pipeline cache."""
+        if not self.enable_cache:
+            return
+        try:
+            if job_id:
+                job_cache_dir = self.pipeline_cache_dir / job_id
+                if job_cache_dir.exists():
+                    import shutil
+                    shutil.rmtree(job_cache_dir)
+                    logger.info(f"Cleaned pipeline cache for job: {job_id}")
+            else:
+                # Clean all caches
+                import shutil
+                if self.cache_dir.exists():
+                    shutil.rmtree(self.cache_dir)
+                    logger.info(f"Cleaned all caches in: {self.cache_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to clean cache: {e}")
+    
+    def clean_all_cache(self):
+        """Public method to clean all cache files."""
+        self._clean_cache()
+    
+    def clean_preprocess_cache(self):
+        """Clean only the preprocess cache."""
+        if not self.enable_cache:
+            return
+        try:
+            import shutil
+            if self.preprocess_cache_dir.exists():
+                shutil.rmtree(self.preprocess_cache_dir)
+                self.preprocess_cache_dir.mkdir(parents=True, exist_ok=True)
+                self.dedup_cache_dir.mkdir(parents=True, exist_ok=True)
+                logger.info(f"Cleaned preprocess cache")
+        except Exception as e:
+            logger.warning(f"Failed to clean preprocess cache: {e}")
+    
+    def clean_llm_cache(self):
+        """Clean only the LLM call cache."""
+        if not self.enable_cache:
+            return
+        try:
+            import shutil
+            if self.llm_cache_dir.exists():
+                shutil.rmtree(self.llm_cache_dir)
+                self.question_cache_dir.mkdir(parents=True, exist_ok=True)
+                self.answer_cache_dir.mkdir(parents=True, exist_ok=True)
+                logger.info(f"Cleaned LLM call cache")
+        except Exception as e:
+            logger.warning(f"Failed to clean LLM cache: {e}")
+    
+    def get_cache_stats(self) -> dict:
+        """Get statistics about cache usage."""
+        if not self.enable_cache:
+            return {"cache_enabled": False}
+        
+        def count_files(path):
+            if not path.exists():
+                return 0
+            return len([f for f in path.iterdir() if f.is_file()])
+        
+        def get_size(path):
+            if not path.exists():
+                return 0
+            total = 0
+            for f in path.rglob('*'):
+                if f.is_file():
+                    total += f.stat().st_size
+            return total
+        
+        stats = {
+            "cache_enabled": True,
+            "cache_dir": str(self.cache_dir),
+            "preprocess_cache_files": count_files(self.preprocess_cache_dir),
+            "dedup_cache_files": count_files(self.dedup_cache_dir),
+            "question_cache_files": count_files(self.question_cache_dir),
+            "answer_cache_files": count_files(self.answer_cache_dir),
+            "pipeline_jobs": len([d for d in self.pipeline_cache_dir.iterdir() if d.is_dir()]) if self.pipeline_cache_dir.exists() else 0,
+            "total_cache_size_mb": round(get_size(self.cache_dir) / (1024 * 1024), 2)
+        }
+        
+        return stats
 
     def _split_large_note(self, note_dict: dict, max_tokens: int) -> List[dict]:
         """Split a large note into multiple smaller notes to preserve all content.
@@ -479,6 +642,17 @@ class DiversityDataGenerator:
         Returns:
             Tuple containing entity descriptions, entity types, and QA configuration.
         """
+        # Check preprocess cache
+        if self.enable_cache:
+            input_hash = self._get_input_hash(entities_path, note_list, config_path, graph_path, user_name)
+            cache_path = self.preprocess_cache_dir / f"{input_hash}.pkl"
+            cached_result = self._load_cache(cache_path)
+            if cached_result is not None:
+                logger.info(f"Loaded preprocess result from cache: {cache_path}")
+                return cached_result
+        
+        logger.info("Running preprocess (not cached)")
+        
         entity_df = pd.read_parquet(graph_path)
         entity2type = {
             item["title"]: item["type"] for item in entity_df.to_dict(orient="records")
@@ -527,17 +701,41 @@ class DiversityDataGenerator:
         }
         entity2desc = filtered_data
 
-        # clean note level data
+        # clean note level data with cached deduplication
         for entity, entity_info in entity2desc.copy().items():
             clusters = entity_info["note"]
-            unique_dicts, cnt = dedup_by_similarity(clusters, similarity_threshold=0.9) # need to adjust min_trigram_jaccard threshold based on data length
+            
+            # Check dedup cache for this entity
+            dedup_cache_path = None
+            if self.enable_cache:
+                entity_hash = self._generate_hash(entity, clusters)
+                dedup_cache_path = self.dedup_cache_dir / f"{entity_hash}.pkl"
+                cached_dedup = self._load_cache(dedup_cache_path)
+                if cached_dedup is not None:
+                    logger.debug(f"Loaded dedup result for entity {entity} from cache")
+                    entity2desc[entity]["note"] = cached_dedup
+                    continue
+            
+            # Run deduplication if not cached
+            unique_dicts, cnt = dedup_by_similarity(clusters, similarity_threshold=0.9)
             entity2desc[entity]["note"] = unique_dicts
+            
+            # Save dedup result to cache
+            if self.enable_cache and dedup_cache_path:
+                self._save_cache(dedup_cache_path, unique_dicts)
 
         # read config file
         with open(config_path, "r", encoding="utf-8") as f:
             QA_config = json.load(f)
 
-        return entity2desc, entity2type, QA_config
+        result = (entity2desc, entity2type, QA_config)
+        
+        # Save preprocess result to cache
+        if self.enable_cache:
+            self._save_cache(cache_path, result)
+            logger.info(f"Saved preprocess result to cache: {cache_path}")
+
+        return result
 
 
     def _get_A_input(self, cluster: dict, question: str, user_name: str) -> str:
@@ -643,7 +841,7 @@ class DiversityDataGenerator:
 
 
     def generate_data(self, entities_path: str, note_list: list, config_path: str, 
-                     graph_path: str, user_name: str, global_bio: str, output_path: str):
+                     graph_path: str, user_name: str, global_bio: str, output_path: str, resume_from_cache: bool = True):
         """Generate diversity data based on user notes and entities.
         
         Args:
@@ -654,7 +852,18 @@ class DiversityDataGenerator:
             user_name: Name of the user.
             global_bio: User biography text.
             output_path: Path to save the generated data.
+            resume_from_cache: Whether to resume from cached pipeline steps.
         """
+        # Generate job ID for this run
+        job_id = self._generate_hash(entities_path, config_path, graph_path, user_name, global_bio, 
+                                   self.data_synthesis_mode, str(time.time())[:10])  # Include date for uniqueness
+        logger.info(f"Starting data generation job: {job_id}")
+        
+        # Create job-specific cache directory
+        if self.enable_cache:
+            job_cache_dir = self.pipeline_cache_dir / job_id
+            job_cache_dir.mkdir(parents=True, exist_ok=True)
+        
         language_desc = f"Keep your response in {self.preference_language}"
 
         entity2desc, entity2type, QA_config = self._preprocess(
@@ -726,31 +935,59 @@ class DiversityDataGenerator:
 
         logger.info(f"Filtered tiny clusters: {len(filtered_tiny_clusters)}")
 
+        # Process large clusters with caching
+        data_large = []
         if len(exploded_clusters) > 0:
-            logger.info("Execute large cluster generation")
-            data_large = self._pipline(exploded_clusters, DataSynthesisMode[self.data_synthesis_mode.upper()].value["large_aug_para"], 
-                                       q_dict, templater, language_desc, user_name)
+            large_cache_path = job_cache_dir / "large_clusters_done.pkl" if self.enable_cache else None
+            if resume_from_cache and large_cache_path and large_cache_path.exists():
+                data_large = self._load_cache(large_cache_path)
+                logger.info(f"Loaded large cluster results from cache ({len(data_large)} entries)")
+            else:
+                logger.info("Execute large cluster generation")
+                data_large = self._pipline(exploded_clusters, DataSynthesisMode[self.data_synthesis_mode.upper()].value["large_aug_para"], 
+                                           q_dict, templater, language_desc, user_name, job_id)
+                if self.enable_cache:
+                    self._save_cache(large_cache_path, data_large)
+                    logger.info(f"Saved large cluster results to cache")
         else:
             logger.info("Large cluster number is 0")
-            data_large = []
 
+        # Process mini clusters with caching
+        data_mini = []
         if len(mini_clusters) > 0:
-            logger.info("Execute small cluster generation")
-            data_mini = self._pipline(mini_clusters, DataSynthesisMode[self.data_synthesis_mode.upper()].value["mini_aug_para"], 
-                                      q_dict, templater, language_desc, user_name)
+            mini_cache_path = job_cache_dir / "mini_clusters_done.pkl" if self.enable_cache else None
+            if resume_from_cache and mini_cache_path and mini_cache_path.exists():
+                data_mini = self._load_cache(mini_cache_path)
+                logger.info(f"Loaded mini cluster results from cache ({len(data_mini)} entries)")
+            else:
+                logger.info("Execute small cluster generation")
+                data_mini = self._pipline(mini_clusters, DataSynthesisMode[self.data_synthesis_mode.upper()].value["mini_aug_para"], 
+                                          q_dict, templater, language_desc, user_name, job_id)
+                if self.enable_cache:
+                    self._save_cache(mini_cache_path, data_mini)
+                    logger.info(f"Saved mini cluster results to cache")
         else:
             logger.info("Small cluster number is 0")
-            data_mini = []
 
+        # Process tiny clusters with caching  
+        data_tiny = []
         if len(filtered_tiny_clusters) > 0:
-            logger.info("Execute single entity cluster generation")
-            q_dict.pop("unanswerable")
-            q_dict.pop("global")
-            data_tiny = self._pipline(filtered_tiny_clusters, DataSynthesisMode[self.data_synthesis_mode.upper()].value["tiny_aug_para"], 
-                                      q_dict, templater, language_desc, user_name)
+            tiny_cache_path = job_cache_dir / "tiny_clusters_done.pkl" if self.enable_cache else None
+            if resume_from_cache and tiny_cache_path and tiny_cache_path.exists():
+                data_tiny = self._load_cache(tiny_cache_path)
+                logger.info(f"Loaded tiny cluster results from cache ({len(data_tiny)} entries)")
+            else:
+                logger.info("Execute single entity cluster generation")
+                q_dict_copy = q_dict.copy()  # Don't modify the original
+                q_dict_copy.pop("unanswerable", None)
+                q_dict_copy.pop("global", None)
+                data_tiny = self._pipline(filtered_tiny_clusters, DataSynthesisMode[self.data_synthesis_mode.upper()].value["tiny_aug_para"], 
+                                          q_dict_copy, templater, language_desc, user_name, job_id)
+                if self.enable_cache:
+                    self._save_cache(tiny_cache_path, data_tiny)
+                    logger.info(f"Saved tiny cluster results to cache")
         else:
             logger.info("Single entity cluster number is 0")
-            data_tiny = []
 
         combined_list = data_large + data_mini + data_tiny
         # calculate total entries
@@ -761,10 +998,15 @@ class DiversityDataGenerator:
             json.dump(combined_list, f, ensure_ascii=False, indent=4)
 
         logger.info(f"Data has been stored to {output_path}")
+        
+        # Clean up job-specific cache after successful completion
+        if self.enable_cache:
+            self._clean_cache(job_id)
+            logger.info(f"Cleaned up pipeline cache for completed job: {job_id}")
 
 
     def _pipline(self, clusters: list, aug_para: int, q_dict: dict, 
-                templater, language_desc: str, user_name: str) -> list:
+                templater, language_desc: str, user_name: str, job_id: str = None) -> list:
         """Execute the pipeline for data generation.
         
         Args:
@@ -820,7 +1062,7 @@ class DiversityDataGenerator:
         logger.info(f"Explode questions types: {len(explode_questions_types)}")
 
         questions, answers, answer_types, flat_question_types, flat_clusters = self._generate(
-            explode_clusters, explode_questions_types, templater, q_dict, language_desc, user_name
+            explode_clusters, explode_questions_types, templater, q_dict, language_desc, user_name, job_id
         )
 
         # store data
@@ -850,7 +1092,7 @@ class DiversityDataGenerator:
 
 
     def _generate(self, explode_clusters: list, explode_questions_types: list, 
-                 templater, q_dict: dict, language_desc: str, user_name: str) -> tuple:
+                 templater, q_dict: dict, language_desc: str, user_name: str, job_id: str = None) -> tuple:
         """Generate questions and answers using ThreadPoolExecutor.
         
         Args:
@@ -866,7 +1108,7 @@ class DiversityDataGenerator:
         """
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = [
-                executor.submit(self._Q_generate, cluster, question_type, templater, q_dict, language_desc, user_name)
+                executor.submit(self._Q_generate, cluster, question_type, templater, q_dict, language_desc, user_name, job_id)
                 for cluster, question_type in zip(
                     explode_clusters, explode_questions_types
                 )
@@ -896,7 +1138,7 @@ class DiversityDataGenerator:
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = [
-                executor.submit(self._A_generate, cluster, question, question_type, templater, language_desc, user_name)
+                executor.submit(self._A_generate, cluster, question, question_type, templater, language_desc, user_name, job_id)
                 for cluster, question, question_type in zip(
                     flat_clusters, questions, flat_question_types
                 )
@@ -917,7 +1159,7 @@ class DiversityDataGenerator:
 
 
     def _Q_generate(self, cluster: dict, question_type: str, templater, 
-                   q_dict: dict, language_desc: str, user_name: str) -> list:
+                   q_dict: dict, language_desc: str, user_name: str, job_id: str = None) -> list:
         """Generate questions based on the given cluster and type.
         
         Args:
@@ -927,6 +1169,7 @@ class DiversityDataGenerator:
             q_dict: Dictionary of question types.
             language_desc: Language description string.
             user_name: Name of the user.
+            job_id: Job ID for this generation run.
             
         Returns:
             List of generated questions.
@@ -936,6 +1179,24 @@ class DiversityDataGenerator:
         system_prompt = templater.get_Q_template(
             question_type_prompt=q_dict[question_type]["prompt"]
         )
+        
+        # Check LLM call cache
+        if self.enable_cache:
+            # Create cache key from all input parameters
+            cache_key = self._generate_hash(
+                cluster.get('entity_name', ''), 
+                cluster.get('chunk_info', ''),
+                str(cluster.get('note', [])),  # Convert notes to string for hashing
+                question_type,
+                system_prompt,
+                user_input,
+                language_desc
+            )
+            cache_path = self.question_cache_dir / f"{cache_key}.pkl"
+            cached_questions = self._load_cache(cache_path)
+            if cached_questions is not None:
+                logger.debug(f"Loaded Q_generate result from cache for '{cluster.get('entity_name', 'unknown')}'")
+                return cached_questions
         
         messages = [
             {"role": "system", "content": system_prompt},
@@ -987,11 +1248,16 @@ class DiversityDataGenerator:
             if "|" in questions[0] and len(questions) == 0:
                 questions = questions[0].split("|")
 
+        # Save to cache
+        if self.enable_cache:
+            self._save_cache(cache_path, questions)
+            logger.debug(f"Saved Q_generate result to cache for '{cluster.get('entity_name', 'unknown')}'")
+
         return questions
 
 
     def _A_generate(self, cluster: dict, question: str, question_type: str, 
-                   templater, language_desc: str, user_name: str) -> tuple:
+                   templater, language_desc: str, user_name: str, job_id: str = None) -> tuple:
         """Generate answers based on questions and clusters.
         
         Args:
@@ -1001,12 +1267,32 @@ class DiversityDataGenerator:
             templater: Template handler object.
             language_desc: Language description string.
             user_name: Name of the user.
+            job_id: Job ID for this generation run.
             
         Returns:
             Tuple of (answer_text, answer_type).
         """
         user_input = self._get_A_input(cluster, question, user_name)
         system_prompt, answer_type = templater.get_A_template(question_type)
+        
+        # Check LLM call cache
+        if self.enable_cache:
+            # Create cache key from all input parameters
+            cache_key = self._generate_hash(
+                cluster.get('entity_name', ''), 
+                cluster.get('chunk_info', ''),
+                str(cluster.get('note', [])),  # Convert notes to string for hashing
+                question,
+                question_type,
+                system_prompt,
+                user_input,
+                language_desc
+            )
+            cache_path = self.answer_cache_dir / f"{cache_key}.pkl"
+            cached_answer = self._load_cache(cache_path)
+            if cached_answer is not None:
+                logger.debug(f"Loaded A_generate result from cache")
+                return cached_answer
         
         messages = [
             {"role": "system", "content": system_prompt},
@@ -1041,5 +1327,12 @@ class DiversityDataGenerator:
             logger.error(f"API call failed for answer generation: {str(e)}")
             logging.error(traceback.format_exc())
             res = "[ERROR: Could not generate answer due to API failure]"
+        
+        result = (res, answer_type)
+        
+        # Save to cache
+        if self.enable_cache:
+            self._save_cache(cache_path, result)
+            logger.debug(f"Saved A_generate result to cache")
             
-        return res, answer_type
+        return result
