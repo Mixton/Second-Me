@@ -566,7 +566,13 @@ class DiversityDataGenerator:
             "en savoir plus",
             "learn more",
             "code de sécurité",
-            "security code"
+            "security code",
+            "votre code de sécurité avec",
+            "your security code with",
+            "a changé. appuyez pour en savoir plus",
+            "has changed. tap to learn more",
+            "code de sécurité avec",
+            "security code with"
         ]
         
         # Filter lines using simple string matching (memory efficient)
@@ -669,7 +675,13 @@ class DiversityDataGenerator:
                         "en savoir plus",
                         "learn more",
                         "partager. en savoir plus",
-                        "share. learn more"
+                        "share. learn more",
+                        "votre code de sécurité avec",
+                        "your security code with",
+                        "a changé. appuyez pour en savoir plus",
+                        "has changed. tap to learn more",
+                        "code de sécurité avec",
+                        "security code with"
                     ]
                     
                     is_system_message = False
@@ -762,6 +774,189 @@ class DiversityDataGenerator:
                 return True
         
         return False
+
+    def _split_mixed_content(self, content: str) -> tuple:
+        """Split mixed content into chat segments and non-chat content.
+        
+        Args:
+            content: Mixed content that may contain both chat and regular text
+            
+        Returns:
+            Tuple of (chat_segments_list, non_chat_content_string)
+        """
+        if not content or len(content.strip()) < 20:
+            # Even for short content, apply basic cleaning to remove system messages
+            if content and content.strip():
+                cleaned_content = self._clean_raw_content(content)
+                return [], cleaned_content
+            return [], content
+        
+        lines = content.split('\n')
+        chat_segments = []
+        non_chat_lines = []
+        current_chat_segment = []
+        in_chat_segment = False
+        
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if not line:
+                if in_chat_segment:
+                    current_chat_segment.append(lines[i])  # Preserve empty lines in chat
+                else:
+                    non_chat_lines.append(lines[i])
+                i += 1
+                continue
+            
+            line_lower = line.lower()
+            
+            # Strong indicators this line is part of a chat conversation
+            is_chat_line = False
+            
+            # Pattern 1: WhatsApp timestamp format (DD/MM/YYYY, HH:MM - Speaker: message)
+            if (' - ' in line and ':' in line):
+                parts = line.split(' - ', 1)
+                if len(parts) == 2:
+                    date_part = parts[0]
+                    message_part = parts[1]
+                    
+                    # Check for date pattern
+                    if ('/' in date_part and ',' in date_part and ':' in date_part):
+                        digit_count = sum(1 for c in date_part if c.isdigit())
+                        if digit_count >= 8:  # Strong date/time pattern
+                            # Check for speaker pattern
+                            if ':' in message_part and not message_part.startswith('http'):
+                                colon_pos = message_part.find(':')
+                                if 0 < colon_pos < 30:
+                                    is_chat_line = True
+            
+            # Pattern 2: Media indicators
+            if any(indicator in line_lower for indicator in ["<médias omis>", "<media omitted>", "médias omis", "media omitted"]):
+                is_chat_line = True
+            
+            # Pattern 3: If we're already in a chat segment, be more permissive for continuation lines
+            if in_chat_segment and not is_chat_line:
+                # In chat mode, assume lines are chat unless they're clearly structured content
+                if not any(line.startswith(prefix) for prefix in ['Title:', 'Content:', 'AI Insight:', 'Note:', 'Summary:', 'http://', 'https://']):
+                    # Check if this might be a multi-line message continuation
+                    # Don't exit chat mode for simple text lines
+                    if not line.strip() or len(line.strip()) > 5:  # Empty lines or reasonable content
+                        is_chat_line = True
+            
+            # Pattern 4: Simple speaker pattern (more relaxed when looking for chat start)
+            if not is_chat_line and not in_chat_segment and ':' in line and not line.startswith('http') and not line.startswith('Title:'):
+                colon_pos = line.find(':')
+                if 2 < colon_pos < 25:
+                    speaker_part = line[:colon_pos].strip()
+                    # Additional checks to avoid false positives
+                    if (' ' not in speaker_part or len(speaker_part.split()) <= 2):
+                        if not any(char in speaker_part.lower() for char in ['http', 'www', '.com', '@', '#', ':', '/']):
+                            # Look ahead to see if there are more chat-like lines (less strict requirement)
+                            similar_lines_ahead = 0
+                            for j in range(i + 1, min(i + 4, len(lines))):
+                                next_line = lines[j].strip()
+                                if next_line:
+                                    # Check for any chat-like pattern
+                                    if (' - ' in next_line and ':' in next_line) or \
+                                       (':' in next_line and not next_line.startswith('http') and not next_line.startswith('Title:')):
+                                        similar_lines_ahead += 1
+                            
+                            # More relaxed requirement - just need 1 similar line ahead to start chat mode
+                            if similar_lines_ahead >= 1:
+                                is_chat_line = True
+            
+            if is_chat_line:
+                if not in_chat_segment:
+                    # Starting a new chat segment
+                    if non_chat_lines:
+                        # Finish current non-chat content if we have any
+                        pass  # We'll process non_chat_lines at the end
+                    in_chat_segment = True
+                current_chat_segment.append(lines[i])
+            else:
+                if in_chat_segment:
+                    # We're in a chat segment but this line doesn't look like chat
+                    # Be very conservative about exiting chat mode to preserve multi-line messages
+                    
+                    # Only exit chat mode for very strong non-chat indicators:
+                    is_strong_non_chat = False
+                    
+                    # Pattern 1: Looks like structured content (Title:, Content:, etc.)
+                    if any(line.startswith(prefix) for prefix in ['Title:', 'Content:', 'AI Insight:', 'Note:', 'Summary:', 'http://', 'https://']):
+                        is_strong_non_chat = True
+                    
+                    # Pattern 2: Look for a clear break in conversation (multiple structured lines)
+                    if not is_strong_non_chat:
+                        # Look ahead to see if we have clear non-chat structure
+                        structured_lines_ahead = 0
+                        for j in range(i, min(i + 4, len(lines))):
+                            if j < len(lines):
+                                future_line = lines[j].strip()
+                                if future_line:
+                                    # Check if this looks like structured content
+                                    if any(future_line.startswith(prefix) for prefix in ['Title:', 'Content:', 'AI Insight:', 'Note:', 'Summary:']):
+                                        structured_lines_ahead += 1
+                                    elif future_line.startswith('http'):
+                                        structured_lines_ahead += 1
+                                    elif len(future_line) > 50 and future_line.count(' ') > 8 and ':' not in future_line[:30]:
+                                        # Long descriptive text without chat patterns
+                                        structured_lines_ahead += 1
+                        
+                        # Only exit if we see multiple structured lines (clear document structure)
+                        if structured_lines_ahead >= 2:
+                            is_strong_non_chat = True
+                    
+                    # Pattern 3: Very long lines without chat structure (likely paragraphs)
+                    if not is_strong_non_chat and len(line) > 100 and ':' not in line[:30] and ' - ' not in line:
+                        # Look for more long lines indicating prose text
+                        long_lines_ahead = sum(1 for j in range(i, min(i + 3, len(lines))) 
+                                             if j < len(lines) and len(lines[j]) > 80)
+                        if long_lines_ahead >= 2:
+                            is_strong_non_chat = True
+                    
+                    if is_strong_non_chat:
+                        # Ending a chat segment - save what we have
+                        if current_chat_segment:
+                            segment_text = '\n'.join(current_chat_segment)
+                            # Be more lenient about accepting chat segments
+                            if len(segment_text.strip()) > 20:  # Reduced threshold
+                                chat_segments.append(segment_text)
+                            else:
+                                non_chat_lines.extend(current_chat_segment)
+                            current_chat_segment = []
+                        in_chat_segment = False
+                        non_chat_lines.append(lines[i])
+                    else:
+                        # Stay in chat mode - treat as continuation of multi-line message
+                        current_chat_segment.append(lines[i])
+                else:
+                    non_chat_lines.append(lines[i])
+            
+            i += 1
+        
+        # Handle any remaining chat segment
+        if current_chat_segment:
+            segment_text = '\n'.join(current_chat_segment)
+            # Be more lenient about accepting chat segments at the end
+            if len(segment_text.strip()) > 20:  # Reduced threshold from 30 to 20
+                chat_segments.append(segment_text)
+            else:
+                non_chat_lines.extend(current_chat_segment)
+        
+        # Combine non-chat lines and clean up
+        non_chat_content = '\n'.join(non_chat_lines).strip()
+        if non_chat_content:
+            non_chat_content = self._clean_raw_content(non_chat_content)
+        
+        # Debug logging
+        if chat_segments and non_chat_content:
+            logger.debug(f"Split mixed content: {len(chat_segments)} chat segments, {len(non_chat_content)} chars non-chat")
+        elif chat_segments:
+            logger.debug(f"Content is pure chat: {len(chat_segments)} segments")
+        elif non_chat_content:
+            logger.debug(f"Content is pure non-chat: {len(non_chat_content)} chars")
+        
+        return chat_segments, non_chat_content
 
     def _clean_raw_content(self, content: str) -> str:
         """Clean raw content to remove WhatsApp system messages and media indicators.
@@ -870,40 +1065,55 @@ class DiversityDataGenerator:
                 
                 content = f"Title: {title}\nContent: {content_body}\nAI Insight: {insight}".strip()
             
-            # Check if this looks like chat data
-            if self._is_chat_content(content):
-                # Extract relevant chat segments
-                segments = self._extract_relevant_chat_segments(
-                    content, entity_name, entity_description, context_window=2
-                )
+            # Handle mixed content - split into chat and non-chat segments
+            chat_segments, non_chat_content = self._split_mixed_content(content)
+            
+            processed_content_parts = []
+            
+            # Process chat segments if any exist
+            if chat_segments:
+                relevant_chat_segments = []
+                for chat_segment in chat_segments:
+                    segments = self._extract_relevant_chat_segments(
+                        chat_segment, entity_name, entity_description, context_window=2
+                    )
+                    relevant_chat_segments.extend(segments)
                 
-                if segments:
-                    # Create processed note with relevant segments
-                    processed_note = note.copy()
+                if relevant_chat_segments:
+                    processed_content_parts.extend(relevant_chat_segments)
+                    total_segments_extracted += len(relevant_chat_segments)
+                    logger.info(f"Extracted {len(relevant_chat_segments)} relevant chat segments for entity '{entity_name}'")
+            
+            # Process non-chat content - always include it (no relevance filtering for non-chat)
+            if non_chat_content:
+                processed_content_parts.append(non_chat_content)
+                logger.debug(f"Kept all non-chat content for entity '{entity_name}' (no relevance filtering applied)")
+            
+            # Create processed note if we have any relevant content
+            if processed_content_parts:
+                processed_note = note.copy()
+                final_content = "\n\n".join(processed_content_parts)
+                
+                if "processed" in processed_note:
+                    processed_note["processed"] = final_content
+                else:
+                    processed_note["title"] = f"{title} (Processed content)"
+                    processed_note["content"] = final_content
                     
-                    # Combine segments into processed content
-                    segments_text = "\n\n".join(segments)
+                    # Create informative insight
+                    insight_parts = []
+                    if chat_segments and any("Chat segment" in part for part in processed_content_parts):
+                        chat_count = len([p for p in processed_content_parts if "Chat segment" in p])
+                        insight_parts.append(f"Extracted {chat_count} relevant chat segments")
+                    if non_chat_content and any(part == non_chat_content for part in processed_content_parts):
+                        insight_parts.append("Included all non-chat content")
                     
-                    if "processed" in processed_note:
-                        processed_note["processed"] = segments_text
+                    if insight_parts:
+                        processed_note["insight"] = f"{' and '.join(insight_parts)} related to {entity_name}"
                     else:
-                        processed_note["title"] = f"{title} (Relevant segments)"
-                        processed_note["content"] = segments_text
-                        processed_note["insight"] = f"Extracted {len(segments)} relevant chat segments related to {entity_name}"
-                    
-                    processed_notes.append(processed_note)
-                    total_segments_extracted += len(segments)
-                    
-                    logger.info(f"Extracted {len(segments)} relevant segments from chat note for entity '{entity_name}'")
-            else:
-                # For non-chat content, apply basic relevance filtering
-                relevance_score = self._calculate_basic_relevance(content, entity_name, entity_description)
-                if relevance_score >= relevance_threshold:
-                    processed_notes.append(note.copy())
-                elif len(processed_notes) == 0 and relevance_score > 0:
-                    # If no notes pass the threshold but this note has some relevance, keep it
-                    processed_notes.append(note.copy())
-                    logger.info(f"Kept low-relevance note for entity '{entity_name}' (score: {relevance_score:.2f})")
+                        processed_note["insight"] = f"Processed mixed content related to {entity_name}"
+                
+                processed_notes.append(processed_note)
         
         # Limit number of notes if specified
         if max_notes and len(processed_notes) > max_notes:
@@ -931,7 +1141,7 @@ class DiversityDataGenerator:
         return processed_notes, stats
 
     def _is_chat_content(self, content: str) -> bool:
-        """Determine if content appears to be chat/conversation data.
+        """Determine if content appears to be chat/conversation data with high precision.
         
         Args:
             content: Text content to analyze
@@ -939,47 +1149,126 @@ class DiversityDataGenerator:
         Returns:
             True if content appears to be chat conversation
         """
-        # Use simple string operations for better memory efficiency
-        content_lower = content.lower()
-        
-        # Check for common chat indicators using string containment (much faster)
-        chat_keywords = ["<médias omis>", "<media omitted>", "<omitted>"]
-        media_indicator_count = sum(1 for keyword in chat_keywords if keyword in content_lower)
-        
-        # Count lines that look like timestamps and messages using simple parsing
+        if not content or len(content.strip()) < 50:
+            # Exception: detect WhatsApp system messages even if they're short
+            content_lower = content.lower()
+            whatsapp_system_indicators = [
+                "messages et les appels sont chiffrés",
+                "messages and calls are end-to-end encrypted", 
+                "seules les personnes prenant part",
+                "médias omis",
+                "media omitted",
+                "votre code de sécurité avec",
+                "your security code with",
+                "code de sécurité avec",
+                "security code with"
+            ]
+            
+            if any(indicator in content_lower for indicator in whatsapp_system_indicators):
+                return True  # Treat system messages as chat so they get filtered out
+            
+            return False
+            
         lines = content.split('\n')
-        whatsapp_message_lines = 0
-        speaker_lines = 0
-        timestamp_lines = 0
+        total_lines = len([line for line in lines if line.strip()])
         
+        if total_lines < 3:  # Need at least 3 meaningful lines for chat
+            return False
+        
+        # Look for very specific WhatsApp patterns
+        whatsapp_patterns_found = 0
+        media_omitted_count = 0
+        date_speaker_message_count = 0
+        speaker_message_count = 0
+        
+        # Check each line for specific chat patterns
         for line in lines:
             line_stripped = line.strip()
             if not line_stripped:
                 continue
-                
-            # Simple timestamp detection (faster than regex)
-            if ('/' in line_stripped or '-' in line_stripped) and ':' in line_stripped:
-                # Check if it looks like a WhatsApp timestamp format
-                if len([c for c in line_stripped[:20] if c.isdigit()]) >= 6:  # At least 6 digits in first 20 chars
-                    timestamp_lines += 1
-                    if ' - ' in line_stripped and ':' in line_stripped[line_stripped.find(' - '):]:
-                        whatsapp_message_lines += 1
             
-            # Simple speaker detection
-            if ':' in line_stripped and not line_stripped.startswith('http'):
+            line_lower = line_stripped.lower()
+            
+            # Pattern 1: WhatsApp media indicators (very strong indicator)
+            if any(indicator in line_lower for indicator in ["<médias omis>", "<media omitted>", "médias omis", "media omitted"]):
+                media_omitted_count += 1
+                whatsapp_patterns_found += 1
+            
+            # Pattern 2: WhatsApp timestamp format with speaker (DD/MM/YYYY, HH:MM - Speaker: message)
+            # Very specific pattern: date/time - speaker: message
+            if (' - ' in line_stripped and ':' in line_stripped):
+                # Check if it starts with date-like pattern
+                parts = line_stripped.split(' - ', 1)
+                if len(parts) == 2:
+                    date_part = parts[0]
+                    message_part = parts[1]
+                    
+                    # Check if first part looks like WhatsApp timestamp (DD/MM/YYYY, HH:MM)
+                    if ('/' in date_part and ',' in date_part and ':' in date_part):
+                        # Count digits in date part - should have date and time
+                        digit_count = sum(1 for c in date_part if c.isdigit())
+                        if digit_count >= 8:  # At least DD MM YYYY HH MM = 8+ digits
+                            # Check if message part has speaker pattern (Speaker: message)
+                            if ':' in message_part and not message_part.startswith('http'):
+                                colon_pos = message_part.find(':')
+                                if 0 < colon_pos < 30:  # Reasonable speaker name length
+                                    date_speaker_message_count += 1
+                                    whatsapp_patterns_found += 2  # Strong indicator
+            
+            # Pattern 3: Simple speaker: message pattern (weaker, only count if no timestamps)
+            elif ':' in line_stripped and not line_stripped.startswith('http') and not line_stripped.startswith('Title:'):
                 colon_pos = line_stripped.find(':')
-                if colon_pos > 0 and colon_pos < 50:  # Reasonable speaker name length
-                    speaker_lines += 1
+                if 2 < colon_pos < 25:  # Reasonable speaker name length
+                    speaker_part = line_stripped[:colon_pos].strip()
+                    # Make sure it looks like a name, not a URL or other text
+                    if (' ' not in speaker_part or len(speaker_part.split()) <= 3):  # Single name or short name
+                        if not any(char in speaker_part.lower() for char in ['http', 'www', '.com', '@', '#']):
+                            speaker_message_count += 1
         
-        # Consider it chat if we have:
-        # 1. Multiple media indicators, OR
-        # 2. Multiple WhatsApp-style message lines, OR  
-        # 3. Multiple speaker lines, OR
-        # 4. Multiple timestamp lines
-        return (media_indicator_count >= 2 or 
-                whatsapp_message_lines >= 3 or 
-                speaker_lines >= 5 or
-                timestamp_lines >= 3)
+        # Scoring system - more lenient for better detection
+        total_score = 0
+        
+        # Media indicators are strong evidence 
+        if media_omitted_count >= 2:
+            total_score += 12
+        elif media_omitted_count == 1:
+            total_score += 5
+        
+        # WhatsApp timestamp format with speakers is very strong evidence
+        if date_speaker_message_count >= 2:
+            total_score += 15
+        elif date_speaker_message_count == 1:
+            total_score += 8  # Even one WhatsApp format line is strong evidence
+        
+        # Simple speaker patterns are moderate evidence (more lenient)
+        if speaker_message_count >= 5:
+            total_score += 8
+        elif speaker_message_count >= 3:
+            total_score += 5
+        elif speaker_message_count >= 2:
+            total_score += 3
+        elif speaker_message_count == 1:
+            total_score += 1
+        
+        # Density check - what percentage of lines look like chat?
+        chat_like_lines = media_omitted_count + date_speaker_message_count + speaker_message_count
+        chat_density = chat_like_lines / total_lines if total_lines > 0 else 0
+        
+        # More lenient criteria:
+        # 1. Strong evidence (score >= 8) with minimal density (>10%), OR  
+        # 2. Very strong evidence (score >= 12) regardless of density, OR
+        # 3. Moderate evidence (score >= 5) with good density (>30%)
+        is_chat = (total_score >= 8 and chat_density >= 0.1) or \
+                  (total_score >= 12) or \
+                  (total_score >= 5 and chat_density >= 0.3)
+        
+        # Debug logging for analysis
+        if total_score >= 5:  # Log cases that have some chat indicators
+            logger.debug(f"Chat detection - Score: {total_score}, Density: {chat_density:.2f}, "
+                        f"Media: {media_omitted_count}, DateSpeaker: {date_speaker_message_count}, "
+                        f"Speaker: {speaker_message_count}, Lines: {total_lines}, Result: {is_chat}")
+        
+        return is_chat
 
     def _calculate_basic_relevance(self, content: str, entity_name: str, entity_description: str) -> float:
         """Calculate basic relevance for non-chat content.
@@ -1018,10 +1307,34 @@ class DiversityDataGenerator:
                 overlap = len(desc_words.intersection(content_words))
                 desc_score = min((overlap / len(desc_words)) * 0.3, 0.3)
         
-        # Base score for any content (minimal relevance)
-        base_score = 0.1 if len(content.strip()) > 20 else 0.0
+        # Check if this is a system message (should get zero relevance)
+        system_indicators = [
+            "les messages et les appels sont chiffrés",
+            "messages and calls are end-to-end encrypted",
+            "seules les personnes prenant part",
+            "only people taking part", 
+            "en savoir plus",
+            "learn more",
+            "partager. en savoir plus",
+            "share. learn more",
+            "votre code de sécurité avec",
+            "your security code with",
+            "code de sécurité avec",
+            "security code with",
+            "a changé. appuyez pour en savoir plus",
+            "has changed. tap to learn more"
+        ]
+        
+        is_system_message = any(indicator in content_lower for indicator in system_indicators)
+        
+        # Base score for any content (minimal relevance) - but not for system messages
+        base_score = 0.1 if len(content.strip()) > 20 and not is_system_message else 0.0
         
         total_score = min(direct_score + partial_score + desc_score + base_score, 1.0)
+        
+        # Force zero score for system messages
+        if is_system_message:
+            total_score = 0.0
         
         # Debug logging for very low scores
         if total_score < 0.2:
@@ -1470,7 +1783,7 @@ class DiversityDataGenerator:
         """
         # CRITICAL: Check memory at start and clean if necessary
         initial_memory = self._get_current_memory_usage()
-        if initial_memory > 15000:  # 15GB - emergency cleanup
+        if initial_memory > 10000:  # 10GB - emergency cleanup
             logger.warning(f"CRITICAL: Initial memory usage {initial_memory:.1f} MB - performing emergency cleanup")           
             self._force_garbage_collection()
         
@@ -1674,9 +1987,9 @@ class DiversityDataGenerator:
             # Memory check before processing large entities
             current_memory = self._get_current_memory_usage()
             cluster_count = len(clusters)
-            if cluster_count > 1000 or current_memory > 20000:  # 20GB threshold
+            if cluster_count > 1000 or current_memory > 10000:  # 10GB threshold
                 logger.warning(f"Processing large entity '{entity}' with {cluster_count} clusters, current memory: {current_memory:.1f} MB")
-                if current_memory > 25000:  # 25GB critical threshold
+                if current_memory > 15000:  # 15GB critical threshold
                     logger.error(f"CRITICAL: Memory usage too high before processing '{entity}': {current_memory:.1f} MB")
                     self.emergency_memory_cleanup()
                     # Check if cleanup helped
@@ -1798,8 +2111,8 @@ class DiversityDataGenerator:
         
         # Check final memory usage
         final_memory = self._get_current_memory_usage()
-        if final_memory > 25000:  # 25GB
-            logger.warning(f"High memory usage at end of preprocessing: {final_memory:.1f} MB")            
+        if final_memory > 15000:  # 15GB
+            logger.warning(f"High memory usage at end of preprocessing: {final_memory:.1f} MB")
 
         return result
 
